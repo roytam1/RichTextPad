@@ -9,31 +9,50 @@
  *   - Save .RTF / .MD
  *   - Save As
  *   - Basic Edit menu
+ *   - Markdown source / rich view toggle
+ *   - Clickable links (EN_LINK opens default browser)
  *
  * Build with something similar to:
  *
- *   cl rtfedit.c user32.lib gdi32.lib comdlg32.lib
+ *   cl rtfedit.c user32.lib gdi32.lib comdlg32.lib shell32.lib
  *
  * or MinGW:
  *
  *   gcc -std=c89 -mwindows rtfedit.c -o rtfedit.exe \
- *       -luser32 -lgdi32 -lcomdlg32
+ *       -luser32 -lgdi32 -lcomdlg32 -lshell32
  */
 
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <richedit.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
+#ifndef IDC_HAND
+#define IDC_HAND MAKEINTRESOURCE(32649)
+#endif
+
+#ifndef CFM_LINK
+#define CFM_LINK 0x02000000
+#endif
+#ifndef CFE_LINK
+#define CFE_LINK CFM_LINK
+#endif
+
+/* DWORD_PTR carries pointers (EDITSTREAM cookies). The fallback is
+   32-bit only: on 64-bit the SDK type must be used, otherwise stream
+   cookies get truncated to 32 bits. */
+#ifndef _WIN64
 #ifndef DWORD_PTR
 #define DWORD_PTR DWORD
 #endif
 #ifndef UINT_PTR
 #define UINT_PTR UINT
+#endif
 #endif
 #ifndef SCF_ALL
 #define SCF_ALL 0x0004
@@ -67,6 +86,7 @@ static char       g_filename[MAX_PATH];
 static int        g_showSource;
 
 static void reset_source_format(void);
+static void apply_link_effects(const char *md);
 
 /*
  * ----------------------------------------------------------------------
@@ -1548,6 +1568,16 @@ md_append_raw(StrBuf *out, unsigned long cp)
     return sb_append_n(out, tmp, (size_t)nb);
 }
 
+/* ASCII word char, mirroring the md_inline intra-word '_' rule
+   (which uses byte isalnum in the C locale). */
+static int
+is_md_wordchar(unsigned char c)
+{
+    return (c >= '0' && c <= '9') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z');
+}
+
 static StrBuf *
 rtf_target(RtfParse *st)
 {
@@ -1701,6 +1731,39 @@ rtf_append_plain(RtfParse *st, const char *s, size_t n)
         {
             if (!md_append_raw(t, cp))
                 return 0;
+        }
+        else if (cp == '_' && t != &st->fld_result)
+        {
+            /* Mirror md_inline: '_' between word chars is literal
+               (identifiers like test_avif2pnm need no slash);
+               elsewhere it toggles italics, so it must be escaped. */
+            unsigned char pc;
+            unsigned char nc;
+            int prev_a;
+            int next_a;
+
+            if (i > 0)
+                pc = (unsigned char)s[i - 1];
+            else if (t->len > 0)
+                pc = (unsigned char)t->data[t->len - 1];
+            else
+                pc = 0;
+            if (i + (size_t)nb < n)
+                nc = (unsigned char)s[i + nb];
+            else
+                nc = 0;
+            prev_a = is_md_wordchar(pc);
+            next_a = is_md_wordchar(nc);
+            if (prev_a && next_a)
+            {
+                if (!sb_append_char(t, '_'))
+                    return 0;
+            }
+            else
+            {
+                if (!md_append_codepoint(t, cp))
+                    return 0;
+            }
         }
         else
         {
@@ -3220,9 +3283,9 @@ LoadMarkdown(HWND hwndEdit, const char *filename)
         return 1;
     }
     rtf = md_to_rtf(md);
-    free(md);
     if (rtf == NULL)
     {
+        free(md);
         MessageBox(hwndEdit,
                    "Out of memory.",
                    "Open",
@@ -3243,6 +3306,7 @@ LoadMarkdown(HWND hwndEdit, const char *filename)
     free(rtf);
     if (es.dwError != 0)
     {
+        free(md);
         MessageBox(hwndEdit,
                    "Unable to load the file.",
                    "Open",
@@ -3252,6 +3316,8 @@ LoadMarkdown(HWND hwndEdit, const char *filename)
     strncpy(g_filename, filename, MAX_PATH - 1);
     g_filename[MAX_PATH - 1] = '\0';
     UpdateTitle();
+    apply_link_effects(md);
+    free(md);
     return 1;
 }
 
@@ -3616,9 +3682,9 @@ SetSourceMode(int on)
             return;
         }
         conv = md_to_rtf(out);
-        free(out);
         if (conv == NULL)
         {
+            free(out);
             MessageBox(g_hwndMain,
                        "Out of memory.",
                        WND_TITLE,
@@ -3628,6 +3694,7 @@ SetSourceMode(int on)
         if (!stream_editor_in(g_hwndEdit, SF_RTF, conv))
         {
             free(conv);
+            free(out);
             MessageBox(g_hwndMain,
                        "Unable to show rich text.",
                        WND_TITLE,
@@ -3635,9 +3702,635 @@ SetSourceMode(int on)
             return;
         }
         free(conv);
+        apply_link_effects(out);
+        free(out);
         g_showSource = 0;
     }
     UpdateSourceCheck();
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Markdown links -> CFE_LINK effects (clickable on every RichEdit)
+ * ----------------------------------------------------------------------
+ *
+ * HYPERLINK fields are only honored by newer controls (Msftedit):
+ * RichEdit20 2.0/3.x expands them to "display <url>" plain text, so the
+ * display part never fires EN_LINK there. Applying CFE_LINK to each
+ * link display range after load makes display clicks notify on every
+ * version; the URL is recovered at click time (field RTF on new
+ * controls, nearby "<url>"/bare URL text on old ones).
+ */
+
+#define MD_MAX_LINKS 256
+#define MD_LINK_TEXT_MAX 256
+#define MD_LINK_URL_MAX 1024
+
+typedef struct
+{
+    char text[MD_LINK_TEXT_MAX];
+    char url[MD_LINK_URL_MAX];
+} MdLink;
+
+/* Collect [text](url) pairs in document order, skipping fenced code,
+   indented code lines and `inline code` (mirrors md_to_rtf). */
+static int
+md_collect_links(const char *md, MdLink *out, int cap)
+{
+    size_t mdlen;
+    size_t pos;
+    int in_fence;
+    int n;
+
+    if (md == NULL || out == NULL || cap <= 0)
+        return 0;
+    mdlen = strlen(md);
+    pos = 0;
+    in_fence = 0;
+    n = 0;
+    while (pos < mdlen)
+    {
+        size_t eol;
+        size_t len;
+        char *line;
+        int i;
+        int in_code;
+
+        eol = pos;
+        while (eol < mdlen && md[eol] != '\n' && md[eol] != '\r')
+            eol++;
+        len = eol - pos;
+        line = (char *)malloc(len + 1);
+        if (line == NULL)
+            return n;
+        if (len > 0)
+            memcpy(line, md + pos, len);
+        line[len] = '\0';
+        if (eol < mdlen && md[eol] == '\r' &&
+            eol + 1 < mdlen && md[eol + 1] == '\n')
+            pos = eol + 2;
+        else if (eol < mdlen)
+            pos = eol + 1;
+        else
+            pos = eol;
+
+        if (md_is_fence(line))
+        {
+            in_fence = !in_fence;
+            free(line);
+            continue;
+        }
+        if (in_fence)
+        {
+            free(line);
+            continue;
+        }
+        if (line[0] == '\t' ||
+            (line[0] == ' ' && line[1] == ' ' &&
+             line[2] == ' ' && line[3] == ' '))
+        {
+            free(line);
+            continue;
+        }
+        in_code = 0;
+        i = 0;
+        while (line[i] != '\0')
+        {
+            if (line[i] == '`')
+            {
+                in_code = !in_code;
+                i++;
+            }
+            else if (!in_code && line[i] == '[' &&
+                     !(i > 0 && line[i - 1] == '\\'))
+            {
+                const char *t;
+                const char *u;
+                const char *ve;
+                size_t tlen;
+                size_t ulen;
+
+                t = line + i + 1;
+                u = strchr(t, ']');
+                if (u != NULL && *(u + 1) == '(')
+                {
+                    ve = strchr(u + 2, ')');
+                    if (ve != NULL)
+                    {
+                        tlen = (size_t)(u - t);
+                        ulen = (size_t)(ve - (u + 2));
+                        if (tlen > 0 && tlen < MD_LINK_TEXT_MAX &&
+                            ulen > 0 && ulen < MD_LINK_URL_MAX &&
+                            n < cap)
+                        {
+                            memcpy(out[n].text, t, tlen);
+                            out[n].text[tlen] = '\0';
+                            memcpy(out[n].url, u + 2, ulen);
+                            out[n].url[ulen] = '\0';
+                            n++;
+                            if (n >= cap)
+                            {
+                                free(line);
+                                return n;
+                            }
+                        }
+                        i = (int)(ve - line) + 1;
+                        continue;
+                    }
+                }
+                i++;
+            }
+            else
+            {
+                i++;
+            }
+        }
+        free(line);
+    }
+    return n;
+}
+
+static int
+range_has_link(LONG s, LONG e)
+{
+    CHARRANGE cr;
+    CHARRANGE old;
+    CHARFORMATA cf;
+
+    if (s < 0 || e <= s)
+        return 0;
+    cr.cpMin = s;
+    cr.cpMax = e;
+    SendMessage(g_hwndEdit, EM_EXGETSEL, 0, (LPARAM)&old);
+    SendMessage(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
+    memset(&cf, 0, sizeof(cf));
+    cf.cbSize = sizeof(cf);
+    SendMessage(g_hwndEdit, EM_GETCHARFORMAT,
+                (WPARAM)SCF_SELECTION, (LPARAM)&cf);
+    SendMessage(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)&old);
+    return (cf.dwMask & CFM_LINK) && (cf.dwEffects & CFE_LINK);
+}
+
+static void
+apply_link_effects(const char *md)
+{
+    MdLink *links;
+    int n;
+    int i;
+    LONG pos;
+    CHARRANGE old;
+    CHARRANGE cr;
+    CHARFORMATA cf;
+    WCHAR wtext[MD_LINK_TEXT_MAX];
+    char needle[1024];
+    WCHAR wneedle[1024];
+    FINDTEXTEXW ftw;
+    int wlen;
+    int guard;
+    LONG search;
+    LONG found;
+
+    if (g_hwndEdit == NULL || md == NULL)
+        return;
+    links = (MdLink *)malloc(sizeof(MdLink) * MD_MAX_LINKS);
+    if (links == NULL)
+        return;
+    n = md_collect_links(md, links, MD_MAX_LINKS);
+    if (n <= 0)
+    {
+        free(links);
+        return;
+    }
+    SendMessage(g_hwndEdit, EM_EXGETSEL, 0, (LPARAM)&old);
+    pos = 0;
+    i = 0;
+    while (i < n)
+    {
+        found = 0;
+        /* Phase 1: native field link (Msftedit marks results CFE_LINK).
+           Plain lookalikes are skipped, never linked: no phantoms. */
+        wlen = MultiByteToWideChar(CP_ACP, 0, links[i].text, -1,
+                                   wtext, MD_LINK_TEXT_MAX);
+        if (wlen > 1)
+        {
+            search = pos;
+            guard = 0;
+            while (guard++ < 128)
+            {
+                ftw.chrg.cpMin = search;
+                ftw.chrg.cpMax = -1;
+                ftw.lpstrText = wtext;
+                if (SendMessageW(g_hwndEdit, EM_FINDTEXTEXW,
+                                 (WPARAM)FR_DOWN, (LPARAM)&ftw) < 0)
+                    break;
+                cr.cpMin = ftw.chrgText.cpMin;
+                cr.cpMax = ftw.chrgText.cpMax;
+                if (cr.cpMax <= cr.cpMin || cr.cpMin < search)
+                    break;
+                if (range_has_link(cr.cpMin, cr.cpMax))
+                {
+                    pos = cr.cpMax;
+                    found = 1;
+                    break;
+                }
+                if (cr.cpMax <= search)
+                    break;
+                search = cr.cpMax;
+            }
+        }
+        if (!found)
+        {
+            /* Phase 2: old controls expand fields to "display <url>".
+               Match that exact pattern, link the display part only. */
+            size_t dl;
+            size_t ul;
+            size_t un;
+
+            dl = strlen(links[i].text);
+            ul = strlen(links[i].url);
+            un = ul;
+            while (dl + 3 + un > 800 && un > 16)
+                un--;
+            if (dl > 0 && dl < (size_t)(sizeof(needle) - 4) &&
+                ul > 0 && wlen > 1)
+            {
+                memcpy(needle, links[i].text, dl);
+                needle[dl] = ' ';
+                needle[dl + 1] = '<';
+                memcpy(needle + dl + 2, links[i].url, un);
+                needle[dl + 2 + un] = '\0';
+                if (MultiByteToWideChar(CP_ACP, 0, needle, -1,
+                                        wneedle, 1024) > 1)
+                {
+                    ftw.chrg.cpMin = pos;
+                    ftw.chrg.cpMax = -1;
+                    ftw.lpstrText = wneedle;
+                    if (SendMessageW(g_hwndEdit, EM_FINDTEXTEXW,
+                                     (WPARAM)FR_DOWN,
+                                     (LPARAM)&ftw) >= 0)
+                    {
+                        cr.cpMin = ftw.chrgText.cpMin;
+                        cr.cpMax = cr.cpMin + (wlen - 1);
+                        SendMessage(g_hwndEdit, EM_EXSETSEL, 0,
+                                    (LPARAM)&cr);
+                        memset(&cf, 0, sizeof(cf));
+                        cf.cbSize = sizeof(cf);
+                        cf.dwMask = CFM_LINK;
+                        cf.dwEffects = CFE_LINK;
+                        SendMessage(g_hwndEdit, EM_SETCHARFORMAT,
+                                    (WPARAM)SCF_SELECTION, (LPARAM)&cf);
+                        pos = ftw.chrgText.cpMax;
+                        found = 1;
+                    }
+                }
+            }
+        }
+        i++;
+    }
+    SendMessage(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)&old);
+    free(links);
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Menu
+ * ----------------------------------------------------------------------
+ */
+
+/* Unescape our HYPERLINK field encoding (\'22 -> ", \\ -> \, \{ \}). */
+static char *
+extract_hyperlink_url(const char *rtf)
+{
+    const char *p;
+    const char *q1;
+    const char *q2;
+    char *url;
+    size_t n;
+    size_t i;
+    size_t j;
+
+    if (rtf == NULL)
+        return NULL;
+    p = strstr(rtf, "HYPERLINK");
+    if (p == NULL)
+        return NULL;
+    q1 = strchr(p, '"');
+    if (q1 == NULL)
+        return NULL;
+    q2 = strchr(q1 + 1, '"');
+    if (q2 == NULL || q2 == q1 + 1)
+        return NULL;
+    n = (size_t)(q2 - (q1 + 1));
+    url = (char *)malloc(n + 1);
+    if (url == NULL)
+        return NULL;
+    i = 0;
+    j = 0;
+    while (i < n)
+    {
+        if (q1[1 + i] == '\\' && i + 1 < n)
+        {
+            if (q1[1 + i + 1] == '\\' ||
+                q1[1 + i + 1] == '{' ||
+                q1[1 + i + 1] == '}')
+            {
+                url[j++] = q1[1 + i + 1];
+                i += 2;
+            }
+            else if (q1[1 + i + 1] == '\'' && i + 3 < n &&
+                     rtf_is_hex(q1[1 + i + 2]) &&
+                     rtf_is_hex(q1[1 + i + 3]))
+            {
+                url[j++] = (char)(rtf_hex_val(q1[1 + i + 2]) * 16 +
+                                  rtf_hex_val(q1[1 + i + 3]));
+                i += 4;
+            }
+            else
+            {
+                url[j++] = q1[1 + i];
+                i++;
+            }
+        }
+        else
+        {
+            url[j++] = q1[1 + i];
+            i++;
+        }
+    }
+    url[j] = '\0';
+    return url;
+}
+
+static int
+looks_like_web_url(const char *s)
+{
+    while (*s == ' ' || *s == '\t' ||
+           *s == '\r' || *s == '\n')
+        s++;
+    if (strncmp(s, "http://", 7) == 0 ||
+        strncmp(s, "https://", 8) == 0 ||
+        strncmp(s, "ftp://", 6) == 0 ||
+        strncmp(s, "mailto:", 7) == 0 ||
+        strncmp(s, "www.", 4) == 0)
+        return 1;
+    return 0;
+}
+
+/* First URL-like token in s (for "display <url>" expansions and
+   source-mode "[text](url)" display clicks). Stops at whitespace or
+   <>" chars; a trailing ")" / "]" is stripped only when unbalanced
+   (keeps Wikipedia-style balanced parens intact). */
+static int
+find_url_in_text(const char *s, char *out, int outsz)
+{
+    const char *p;
+    const char *e;
+    size_t n;
+
+    if (s == NULL || out == NULL || outsz <= 1)
+        return 0;
+    p = NULL;
+    if ((e = strstr(s, "https://")) != NULL) p = e;
+    if ((e = strstr(s, "http://")) != NULL &&
+        (p == NULL || e < p)) p = e;
+    if ((e = strstr(s, "ftp://")) != NULL &&
+        (p == NULL || e < p)) p = e;
+    if ((e = strstr(s, "mailto:")) != NULL &&
+        (p == NULL || e < p)) p = e;
+    if ((e = strstr(s, "www.")) != NULL &&
+        (p == NULL || e < p)) p = e;
+    if (p == NULL)
+        return 0;
+    e = p;
+    while (*e != '\0' && *e != ' ' && *e != '\t' &&
+           *e != '\r' && *e != '\n' && *e != '<' &&
+           *e != '>' && *e != '"')
+        e++;
+    while (e > p && (*(e - 1) == '.' || *(e - 1) == ',' ||
+                     *(e - 1) == ';' || *(e - 1) == ':' ||
+                     *(e - 1) == '!' || *(e - 1) == '?' ||
+                     *(e - 1) == '\'' || *(e - 1) == '"'))
+        e--;
+    /* balance-aware trailing paren/bracket strip */
+    for (;;)
+    {
+        int no;
+        int nc;
+        const char *k;
+
+        if (e <= p || (*(e - 1) != ')' && *(e - 1) != ']'))
+            break;
+        no = 0;
+        nc = 0;
+        k = p;
+        while (k < e)
+        {
+            if (*k == '(' || *k == '[')
+                no++;
+            else if (*k == ')' || *k == ']')
+                nc++;
+            k++;
+        }
+        if (nc <= no)
+            break;
+        e--;
+    }
+    n = (size_t)(e - p);
+    if (n == 0 || n > (size_t)(outsz - 1))
+        return 0;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return 1;
+}
+
+/* Visible text of the clicked paragraph (line). Caller frees. */
+static char *
+get_line_text(LONG chpos)
+{
+    LONG ln;
+    LONG ls;
+    LONG llen;
+    LONG cap;
+    char *buf;
+    WORD n16;
+
+    ln = (LONG)SendMessage(g_hwndEdit, EM_EXLINEFROMCHAR, 0,
+                           (LPARAM)chpos);
+    ls = (LONG)SendMessage(g_hwndEdit, EM_LINEINDEX, (WPARAM)ln, 0);
+    if (ls < 0)
+        return NULL;
+    llen = (LONG)SendMessage(g_hwndEdit, EM_LINELENGTH, (WPARAM)ls, 0);
+    if (llen < 0)
+        return NULL;
+    if (llen > 2048)
+        llen = 2048;
+    cap = llen + 1;
+    buf = (char *)malloc((size_t)cap + 1);
+    if (buf == NULL)
+        return NULL;
+    n16 = (WORD)cap;
+    memcpy(buf, &n16, sizeof(n16));
+    llen = (LONG)SendMessage(g_hwndEdit, EM_GETLINE, (WPARAM)ln,
+                             (LPARAM)buf);
+    if (llen < 0)
+        llen = 0;
+    if (llen > cap)
+        llen = cap;
+    buf[llen] = '\0';
+    return buf;
+}
+
+/* Visible text of the current selection (no hidden field codes,
+   dynamically sized; used for auto-detected URLs). */
+static char *
+get_selection_text(void)
+{
+    MemOut m;
+    EDITSTREAM es;
+
+    memset(&m, 0, sizeof(m));
+    memset(&es, 0, sizeof(es));
+    es.dwCookie = (DWORD_PTR)&m;
+    es.pfnCallback = StreamOutMemCallback;
+    SendMessage(g_hwndEdit,
+                EM_STREAMOUT,
+                (WPARAM)(SFF_SELECTION | SF_TEXT),
+                (LPARAM)&es);
+    if (es.dwError != 0 || m.failed || m.buf == NULL)
+    {
+        if (m.buf != NULL)
+            free(m.buf);
+        return NULL;
+    }
+    return m.buf;
+}
+
+/* RTF of the current selection (carries HYPERLINK "url" for fields). */
+static char *
+get_selection_rtf(void)
+{
+    MemOut m;
+    EDITSTREAM es;
+    char *res;
+
+    memset(&m, 0, sizeof(m));
+    memset(&es, 0, sizeof(es));
+    es.dwCookie = (DWORD_PTR)&m;
+    es.pfnCallback = StreamOutMemCallback;
+    SendMessage(g_hwndEdit,
+                EM_STREAMOUT,
+                (WPARAM)(SFF_SELECTION | SF_RTF),
+                (LPARAM)&es);
+    if (es.dwError != 0 || m.failed || m.buf == NULL)
+    {
+        if (m.buf != NULL)
+            free(m.buf);
+        return NULL;
+    }
+    res = m.buf;
+    return res;
+}
+
+static void
+OpenLinkAtRange(CHARRANGE *cr)
+{
+    CHARRANGE old;
+    char *selrtf;
+    char *seltext;
+    char *url;
+    char *line;
+    char urlbuf[2080];
+    char *p;
+
+    if (g_hwndEdit == NULL || cr == NULL)
+        return;
+    url = NULL;
+    SendMessage(g_hwndEdit, EM_EXGETSEL, 0, (LPARAM)&old);
+    SendMessage(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)cr);
+    selrtf = get_selection_rtf();
+    if (selrtf != NULL)
+    {
+        url = extract_hyperlink_url(selrtf);
+        free(selrtf);
+    }
+    if (url == NULL)
+    {
+        seltext = get_selection_text();
+        SendMessage(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)&old);
+        if (seltext != NULL)
+        {
+            if (looks_like_web_url(seltext))
+            {
+                p = seltext;
+                while (*p == ' ' || *p == '\t' ||
+                       *p == '\r' || *p == '\n')
+                    p++;
+                if (strncmp(p, "www.", 4) == 0)
+                {
+                    url = (char *)malloc(strlen(p) + 8);
+                    if (url != NULL)
+                        sprintf(url, "http://%s", p);
+                }
+                else
+                {
+                    url = (char *)malloc(strlen(p) + 1);
+                    if (url != NULL)
+                        strcpy(url, p);
+                }
+            }
+            free(seltext);
+        }
+    }
+    else
+    {
+        SendMessage(g_hwndEdit, EM_EXSETSEL, 0, (LPARAM)&old);
+    }
+    if (url == NULL)
+    {
+        /* Old controls expand fields to "display <url>" with no link
+           effect on the display part; source-mode "[text](url)" display
+           clicks land here too. Search the clicked line. */
+        line = get_line_text(cr->cpMin);
+        if (line != NULL)
+        {
+            if (find_url_in_text(line, urlbuf, sizeof(urlbuf)))
+            {
+                if (strncmp(urlbuf, "www.", 4) == 0)
+                {
+                    url = (char *)malloc(strlen(urlbuf) + 8);
+                    if (url != NULL)
+                        sprintf(url, "http://%s", urlbuf);
+                }
+                else
+                {
+                    url = (char *)malloc(strlen(urlbuf) + 1);
+                    if (url != NULL)
+                        strcpy(url, urlbuf);
+                }
+            }
+            free(line);
+        }
+    }
+    if (url == NULL)
+        return;
+    p = url + strlen(url);
+    while (p > url && (*(p - 1) == ' ' || *(p - 1) == '\t' ||
+                       *(p - 1) == '\r' || *(p - 1) == '\n'))
+        *(--p) = '\0';
+    if (*url == '\0')
+    {
+        free(url);
+        return;
+    }
+    if ((INT_PTR)ShellExecuteA(NULL, "open", url,
+                               NULL, NULL, SW_SHOWNORMAL) <= 32)
+    {
+        MessageBox(g_hwndMain,
+                   "Unable to open link.",
+                   WND_TITLE,
+                   MB_OK | MB_ICONERROR);
+    }
+    free(url);
 }
 
 /*
@@ -3698,6 +4391,8 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
     case WM_CREATE:
         {
+            DWORD evmask;
+
             g_hwndEdit = CreateWindowEx(
                 WS_EX_CLIENTEDGE,
                 g_editClass != NULL ? g_editClass : RICHEDIT_CLASSA,
@@ -3726,6 +4421,19 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                         EM_EXLIMITTEXT,
                         0,
                         (LPARAM)0x7ffffffe);
+
+            /*
+             * EN_LINK notifications make HYPERLINK fields (markdown
+             * links) and auto-detected URLs clickable (see WM_NOTIFY).
+             */
+            evmask = (DWORD)SendMessage(g_hwndEdit,
+                                        EM_GETEVENTMASK, 0, 0);
+            SendMessage(g_hwndEdit,
+                        EM_SETEVENTMASK, 0,
+                        (LPARAM)(evmask | ENM_LINK));
+            SendMessage(g_hwndEdit,
+                        EM_AUTOURLDETECT,
+                        (WPARAM)TRUE, 0);
 
             return 0;
         }
@@ -3788,6 +4496,32 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case IDM_SHOW_SOURCE:
             SetSourceMode(!g_showSource);
             return 0;
+        }
+
+        break;
+
+    case WM_NOTIFY:
+        {
+            LPNMHDR nm;
+
+            nm = (LPNMHDR)lParam;
+            if (nm != NULL && nm->hwndFrom == g_hwndEdit &&
+                nm->code == EN_LINK)
+            {
+                ENLINK *lk;
+
+                lk = (ENLINK *)lParam;
+                if (lk->msg == WM_LBUTTONUP)
+                {
+                    OpenLinkAtRange(&lk->chrg);
+                    return 0;
+                }
+                else if (lk->msg == WM_SETCURSOR)
+                {
+                    SetCursor(LoadCursor(NULL, IDC_HAND));
+                    return 0;
+                }
+            }
         }
 
         break;

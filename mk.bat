@@ -1,1 +1,1 @@
-cl /Ox richedit.c user32.lib comdlg32.lib
+cl /Ox richedit.c user32.lib comdlg32.lib shell32.lib
