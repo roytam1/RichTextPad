@@ -100,7 +100,6 @@ LoadRTF(HWND hwndEdit, const char *filename)
 {
     FILE *fp;
     EDITSTREAM es;
-    LONG result;
 
     fp = fopen(filename, "rb");
 
@@ -118,14 +117,14 @@ LoadRTF(HWND hwndEdit, const char *filename)
     es.dwCookie = (DWORD_PTR)fp;
     es.pfnCallback = StreamInCallback;
 
-    result = (LONG)SendMessage(hwndEdit,
-                               EM_STREAMIN,
-                               (WPARAM)SF_RTF,
-                               (LPARAM)&es);
+    SendMessage(hwndEdit,
+                EM_STREAMIN,
+                (WPARAM)SF_RTF,
+                (LPARAM)&es);
 
     fclose(fp);
 
-    if (result != 0 || es.dwError != 0)
+    if (es.dwError != 0)
     {
         MessageBox(hwndEdit,
                    "Unable to load the RTF file.",
@@ -145,7 +144,6 @@ SaveRTF(HWND hwndEdit, const char *filename)
 {
     FILE *fp;
     EDITSTREAM es;
-    LONG result;
 
     fp = fopen(filename, "wb");
 
@@ -163,14 +161,14 @@ SaveRTF(HWND hwndEdit, const char *filename)
     es.dwCookie = (DWORD_PTR)fp;
     es.pfnCallback = StreamOutCallback;
 
-    result = (LONG)SendMessage(hwndEdit,
-                               EM_STREAMOUT,
-                               (WPARAM)SF_RTF,
-                               (LPARAM)&es);
+    SendMessage(hwndEdit,
+                EM_STREAMOUT,
+                (WPARAM)SF_RTF,
+                (LPARAM)&es);
 
     fclose(fp);
 
-    if (result != 0 || es.dwError != 0)
+    if (es.dwError != 0)
     {
         MessageBox(hwndEdit,
                    "Unable to save the RTF file.",
