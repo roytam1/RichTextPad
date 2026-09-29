@@ -47,9 +47,99 @@
 #define IDC_EDITOR      200
 
 static HINSTANCE g_hInst;
+static HWND       g_hwndMain;
 static HWND       g_hwndEdit;
 static HMODULE     g_hRichEdit;
 static char       g_filename[MAX_PATH];
+
+/*
+ * ----------------------------------------------------------------------
+ * Title bar
+ * ----------------------------------------------------------------------
+ */
+
+static void
+UpdateTitle(void)
+{
+    char title[MAX_PATH + 32];
+
+    if (g_filename[0] == '\0')
+    {
+        strcpy(title, WND_TITLE " - Untitled");
+    }
+    else
+    {
+        sprintf(title, "%s - %s", WND_TITLE, g_filename);
+    }
+
+    if (g_hwndMain != NULL)
+    {
+        SetWindowText(g_hwndMain, title);
+    }
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Command line
+ * ----------------------------------------------------------------------
+ */
+
+static int
+GetCmdLineFile(LPSTR lpCmdLine, char *out, int outSize)
+{
+    char *p;
+    char *end;
+    size_t len;
+
+    if (lpCmdLine == NULL || out == NULL || outSize <= 1)
+        return 0;
+
+    p = lpCmdLine;
+
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    if (*p == '\0')
+        return 0;
+
+    if (*p == '"')
+    {
+        p++;
+        end = strchr(p, '"');
+        if (end != NULL)
+            len = (size_t)(end - p);
+        else
+            len = strlen(p);
+    }
+    else
+    {
+        /* Take whole remainder so paths with spaces work even unquoted. */
+        end = p + strlen(p);
+        while (end > p && (*(end - 1) == ' ' || *(end - 1) == '\t'))
+            end--;
+        len = (size_t)(end - p);
+        /* Strip one pair of surrounding quotes, just in case. */
+        if (len >= 2 && p[0] == '"' && p[len - 1] == '"')
+        {
+            p++;
+            len -= 2;
+        }
+    }
+
+    while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t'))
+        len--;
+
+    if (len == 0)
+        return 0;
+
+    if (len > (size_t)(outSize - 1))
+        len = (size_t)(outSize - 1);
+
+    memcpy(out, p, len);
+    out[len] = '\0';
+
+    return 1;
+}
 
 /*
  * ----------------------------------------------------------------------
@@ -136,6 +226,8 @@ LoadRTF(HWND hwndEdit, const char *filename)
     strncpy(g_filename, filename, MAX_PATH - 1);
     g_filename[MAX_PATH - 1] = '\0';
 
+    UpdateTitle();
+
     return 1;
 }
 
@@ -179,6 +271,8 @@ SaveRTF(HWND hwndEdit, const char *filename)
 
     strncpy(g_filename, filename, MAX_PATH - 1);
     g_filename[MAX_PATH - 1] = '\0';
+
+    UpdateTitle();
 
     return 1;
 }
@@ -431,11 +525,13 @@ WinMain(HINSTANCE hInstance,
     HWND hwnd;
     MSG msg;
     HMENU menu;
+    char cmdFile[MAX_PATH];
 
     (void)hPrevInstance;
-    (void)lpCmdLine;
 
     g_hInst = hInstance;
+    g_hwndMain = NULL;
+    g_hwndEdit = NULL;
     g_filename[0] = '\0';
 
     /*
@@ -492,8 +588,16 @@ WinMain(HINSTANCE hInstance,
         return 1;
     }
 
+    g_hwndMain = hwnd;
+    UpdateTitle();
+
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
+
+    if (GetCmdLineFile(lpCmdLine, cmdFile, MAX_PATH))
+    {
+        LoadRTF(g_hwndEdit, cmdFile);
+    }
 
     while (GetMessage(&msg, NULL, 0, 0) > 0)
     {
