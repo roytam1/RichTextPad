@@ -53,12 +53,55 @@
 #ifndef UINT_PTR
 #define UINT_PTR UINT
 #endif
+#ifndef INT_PTR
+#define INT_PTR INT
+#endif
 #endif
 #ifndef SCF_ALL
 #define SCF_ALL 0x0004
 #endif
 #ifndef RICHEDIT_CLASSA
 #define RICHEDIT_CLASSA "RichEdit20A"
+#endif
+#ifndef EM_FINDTEXTEXW
+#define EM_FINDTEXTEXW (WM_USER + 124)
+#endif
+#ifndef EM_AUTOURLDETECT
+#define EM_AUTOURLDETECT (WM_USER + 91)
+#endif
+#ifndef ENM_LINK
+#define ENM_LINK 0x04000000
+#endif
+#ifndef EN_LINK
+#define EN_LINK 0x070b
+#endif
+
+#if defined(_MSC_VER) && _MSC_VER < 1200
+typedef struct _enlink {
+  NMHDR     nmhdr;
+  UINT      msg;
+  WPARAM    wParam;
+  LPARAM    lParam;
+  CHARRANGE chrg;
+} ENLINK;
+
+typedef struct __charformat {
+  UINT     cbSize;
+  DWORD    dwMask;
+  DWORD    dwEffects;
+  LONG     yHeight;
+  LONG     yOffset;
+  COLORREF crTextColor;
+  BYTE     bCharSet;
+  BYTE     bPitchAndFamily;
+  char     szFaceName[LF_FACESIZE];
+} CHARFORMATA;
+
+typedef struct _findtextexw {
+  CHARRANGE chrg;
+  LPCWSTR   lpstrText;
+  CHARRANGE chrgText;
+} FINDTEXTEXW;
 #endif
 
 #define WNDCLASS_NAME "RichTextPad"
