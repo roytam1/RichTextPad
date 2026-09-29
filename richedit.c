@@ -1526,6 +1526,7 @@ typedef struct
     int font_namelen;
     int fonts_mono[RTF_MAX_FONTS];
     int fonts_tbl;
+    int fonts_mono_any;
 } RtfParse;
 
 static unsigned long
@@ -2652,7 +2653,7 @@ rtf_to_md(const char *rtf)
                         st.font_namelen = 0;
                     }
                     else if (has_param &&
-                             (param == 1 ||
+                             ((param == 1 && !st.fonts_mono_any) ||
                               is_mono_font(&st, (int)param)))
                         rtf_toggle_mono(&st, 1);
                     else
@@ -2853,11 +2854,19 @@ rtf_to_md(const char *rtf)
                     {
                         if (rtf[k] == ';')
                         {
+                            int ismono;
+
                             st.font_name[st.font_namelen] = '\0';
+                            ismono = 0;
                             if (st.font_entry >= 0 &&
                                 st.font_entry < RTF_MAX_FONTS)
-                                st.fonts_mono[st.font_entry] =
+                            {
+                                ismono =
                                     is_mono_font_name(st.font_name);
+                                st.fonts_mono[st.font_entry] = ismono;
+                                if (ismono)
+                                    st.fonts_mono_any = 1;
+                            }
                             st.font_entry = -1;
                             st.font_namelen = 0;
                         }
