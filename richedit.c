@@ -32,9 +32,14 @@
 #ifndef DWORD_PTR
 #define DWORD_PTR DWORD
 #endif
-
-#ifndef MSFTEDIT_CLASS
-#define MSFTEDIT_CLASS "RICHEDIT50W"
+#ifndef UINT_PTR
+#define UINT_PTR UINT
+#endif
+#ifndef SCF_ALL
+#define SCF_ALL 0x0004
+#endif
+#ifndef RICHEDIT_CLASSA
+#define RICHEDIT_CLASSA "RichEdit20A"
 #endif
 
 #define WNDCLASS_NAME "RichTextPad"
