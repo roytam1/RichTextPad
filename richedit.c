@@ -4,9 +4,9 @@
  * Minimal Win32 C89 Rich Text Editor.
  *
  * Features:
- *   - Native Rich Edit control
- *   - Open .RTF
- *   - Save .RTF
+ *   - Native Rich Edit control (Msftedit 4.1+ with RichEdit 3.0 fallback)
+ *   - Open .RTF / .MD (markdown via md<->rtf layer, tables supported)
+ *   - Save .RTF / .MD
  *   - Save As
  *   - Basic Edit menu
  *
@@ -25,10 +25,16 @@
 #include <commdlg.h>
 #include <richedit.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #ifndef DWORD_PTR
 #define DWORD_PTR DWORD
+#endif
+
+#ifndef MSFTEDIT_CLASS
+#define MSFTEDIT_CLASS "RICHEDIT50W"
 #endif
 
 #define WNDCLASS_NAME "RichTextPad"
@@ -50,6 +56,7 @@ static HINSTANCE g_hInst;
 static HWND       g_hwndMain;
 static HWND       g_hwndEdit;
 static HMODULE     g_hRichEdit;
+static const char *g_editClass;
 static char       g_filename[MAX_PATH];
 
 /*
@@ -143,6 +150,191 @@ GetCmdLineFile(LPSTR lpCmdLine, char *out, int outSize)
 
 /*
  * ----------------------------------------------------------------------
+ * Growable string buffer (C89)
+ * ----------------------------------------------------------------------
+ */
+
+typedef struct
+{
+    char *data;
+    size_t len;
+    size_t cap;
+} StrBuf;
+
+static void
+sb_init(StrBuf *sb)
+{
+    sb->data = NULL;
+    sb->len = 0;
+    sb->cap = 0;
+}
+
+static void
+sb_free(StrBuf *sb)
+{
+    if (sb->data != NULL)
+        free(sb->data);
+    sb->data = NULL;
+    sb->len = 0;
+    sb->cap = 0;
+}
+
+static int
+sb_reserve(StrBuf *sb, size_t extra)
+{
+    size_t need;
+    size_t newcap;
+    char *nd;
+
+    need = sb->len + extra + 1;
+    if (need <= sb->cap)
+        return 1;
+
+    newcap = sb->cap != 0 ? sb->cap : 256;
+    while (newcap < need)
+        newcap *= 2;
+
+    nd = (char *)realloc(sb->data, newcap);
+    if (nd == NULL)
+        return 0;
+
+    sb->data = nd;
+    sb->cap = newcap;
+    if (sb->len == 0)
+        sb->data[0] = '\0';
+    return 1;
+}
+
+static int
+sb_append_n(StrBuf *sb, const char *s, size_t n)
+{
+    if (n == 0)
+    {
+        if (sb->data == NULL)
+        {
+            if (!sb_reserve(sb, 1))
+                return 0;
+        }
+        return 1;
+    }
+    if (!sb_reserve(sb, n))
+        return 0;
+    memcpy(sb->data + sb->len, s, n);
+    sb->len += n;
+    sb->data[sb->len] = '\0';
+    return 1;
+}
+
+static int
+sb_append_str(StrBuf *sb, const char *s)
+{
+    return sb_append_n(sb, s, strlen(s));
+}
+
+static int
+sb_append_char(StrBuf *sb, char c)
+{
+    return sb_append_n(sb, &c, 1);
+}
+
+/*
+ * UTF-8 decode (returns 1 on success).
+ */
+static int
+utf8_decode(const unsigned char *s, size_t avail,
+            unsigned long *cp, int *nbytes)
+{
+    unsigned char c;
+
+    if (avail == 0)
+        return 0;
+    c = s[0];
+    if (c < 0x80)
+    {
+        *cp = c;
+        *nbytes = 1;
+        return 1;
+    }
+    else if ((c & 0xE0) == 0xC0)
+    {
+        if (avail < 2)
+            return 0;
+        if ((s[1] & 0xC0) != 0x80)
+            return 0;
+        *cp = ((unsigned long)(c & 0x1F) << 6) |
+              (unsigned long)(s[1] & 0x3F);
+        if (*cp < 0x80)
+            return 0;
+        *nbytes = 2;
+        return 1;
+    }
+    else if ((c & 0xF0) == 0xE0)
+    {
+        if (avail < 3)
+            return 0;
+        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80)
+            return 0;
+        *cp = ((unsigned long)(c & 0x0F) << 12) |
+              ((unsigned long)(s[1] & 0x3F) << 6) |
+              (unsigned long)(s[2] & 0x3F);
+        if (*cp < 0x800)
+            return 0;
+        *nbytes = 3;
+        return 1;
+    }
+    else if ((c & 0xF8) == 0xF0)
+    {
+        if (avail < 4)
+            return 0;
+        if ((s[1] & 0xC0) != 0x80 ||
+            (s[2] & 0xC0) != 0x80 ||
+            (s[3] & 0xC0) != 0x80)
+            return 0;
+        *cp = ((unsigned long)(c & 0x07) << 18) |
+              ((unsigned long)(s[1] & 0x3F) << 12) |
+              ((unsigned long)(s[2] & 0x3F) << 6) |
+              (unsigned long)(s[3] & 0x3F);
+        if (*cp < 0x10000 || *cp > 0x10FFFF)
+            return 0;
+        *nbytes = 4;
+        return 1;
+    }
+    return 0;
+}
+
+static int
+utf8_encode(unsigned long cp, char *out)
+{
+    if (cp < 0x80)
+    {
+        out[0] = (char)cp;
+        return 1;
+    }
+    else if (cp < 0x800)
+    {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    else if (cp < 0x10000)
+    {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    else
+    {
+        out[0] = (char)(0xF0 | (cp >> 18));
+        out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (cp & 0x3F));
+        return 4;
+    }
+}
+
+/*
+ * ----------------------------------------------------------------------
  * RTF streaming callbacks
  * ----------------------------------------------------------------------
  */
@@ -176,6 +368,2516 @@ StreamOutCallback(DWORD_PTR dwCookie, LPBYTE pbBuff,
     if (ferror(fp))
         return 1;
 
+    return 0;
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Markdown -> RTF (MVP + tables, C89)
+ * ----------------------------------------------------------------------
+ */
+
+#define MD_MAX_COLS 16
+#define MD_MAX_ROWS 128
+
+static int
+rtf_append_codepoint(StrBuf *out, unsigned long cp)
+{
+    char tmp[48];
+    long v;
+    long hi;
+    long lo;
+
+    if (cp == 0)
+        return 1;
+    if (cp < 0x20)
+    {
+        if (cp == 9)
+            return sb_append_str(out, "\\tab ");
+        return sb_append_char(out, ' ');
+    }
+    if (cp <= 0xFFFF)
+    {
+        if (cp >= 0xD800 && cp <= 0xDFFF)
+            cp = '?';
+        v = (long)cp;
+        if (v > 32767)
+            v -= 65536;
+        sprintf(tmp, "\\u%ld?", v);
+        return sb_append_str(out, tmp);
+    }
+    cp -= 0x10000;
+    hi = 0xD800 + (long)(cp >> 10);
+    lo = 0xDC00 + (long)(cp & 0x3FF);
+    if (hi > 32767)
+        hi -= 65536;
+    if (lo > 32767)
+        lo -= 65536;
+    sprintf(tmp, "\\u%ld?\\u%ld?", hi, lo);
+    return sb_append_str(out, tmp);
+}
+
+static int
+rtf_append_text(StrBuf *out, const char *s, size_t n)
+{
+    size_t i;
+
+    i = 0;
+    while (i < n)
+    {
+        unsigned char c;
+        unsigned long cp;
+        int nb;
+
+        c = (unsigned char)s[i];
+        if (c == '{' || c == '}' || c == '\\')
+        {
+            if (!sb_append_char(out, '\\'))
+                return 0;
+            if (!sb_append_char(out, (char)c))
+                return 0;
+            i++;
+        }
+        else if (c < 0x80)
+        {
+            if (c == '\t')
+            {
+                if (!sb_append_str(out, "\\tab "))
+                    return 0;
+            }
+            else if (c < 0x20)
+            {
+                if (!sb_append_char(out, ' '))
+                    return 0;
+            }
+            else
+            {
+                if (!sb_append_char(out, (char)c))
+                    return 0;
+            }
+            i++;
+        }
+        else
+        {
+            if (utf8_decode((const unsigned char *)s + i, n - i, &cp, &nb))
+            {
+                if (!rtf_append_codepoint(out, cp))
+                    return 0;
+                i += (size_t)nb;
+            }
+            else
+            {
+                if (!sb_append_char(out, '?'))
+                    return 0;
+                i++;
+            }
+        }
+    }
+    return 1;
+}
+
+static int
+rtf_append_field_url(StrBuf *out, const char *s, size_t n)
+{
+    size_t i;
+
+    i = 0;
+    while (i < n)
+    {
+        char c;
+
+        c = s[i];
+        if (c == '"')
+        {
+            if (!sb_append_str(out, "\\'22"))
+                return 0;
+        }
+        else if (c == '\\' || c == '{' || c == '}')
+        {
+            if (!sb_append_char(out, '\\'))
+                return 0;
+            if (!sb_append_char(out, c))
+                return 0;
+        }
+        else
+        {
+            if (!sb_append_char(out, c))
+                return 0;
+        }
+        i++;
+    }
+    return 1;
+}
+
+static int
+md_is_blank(const char *s)
+{
+    while (*s == ' ' || *s == '\t' || *s == '\r')
+        s++;
+    return *s == '\0';
+}
+
+static int
+md_heading(const char *s, const char **content)
+{
+    int level;
+
+    level = 0;
+    while (level < 6 && s[level] == '#')
+        level++;
+    if (level == 0 || level > 6)
+        return 0;
+    if (s[level] != ' ' && s[level] != '\t' && s[level] != '\0')
+        return 0;
+    s += level;
+    if (*s == ' ' || *s == '\t')
+        s++;
+    *content = s;
+    return level;
+}
+
+static int
+md_is_hrule(const char *s)
+{
+    char c;
+    int n;
+
+    while (*s == ' ' || *s == '\t')
+        s++;
+    c = *s;
+    if (c != '-' && c != '*' && c != '_')
+        return 0;
+    n = 0;
+    while (*s != '\0')
+    {
+        if (*s == c)
+            n++;
+        else if (*s != ' ' && *s != '\t')
+            return 0;
+        s++;
+    }
+    return n >= 3;
+}
+
+static int
+md_parse_ul(const char *s, int *indent, const char **content)
+{
+    int sp;
+
+    sp = 0;
+    while (s[sp] == ' ')
+        sp++;
+    if (s[sp] == '-' || s[sp] == '*' || s[sp] == '+')
+    {
+        if (s[sp + 1] == ' ' || s[sp + 1] == '\t')
+        {
+            *indent = sp / 2;
+            s += sp + 1;
+            while (*s == ' ' || *s == '\t')
+                s++;
+            *content = s;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int
+md_parse_ol(const char *s, int *indent, const char **content,
+            const char **numstart, size_t *numlen)
+{
+    int sp;
+    int d;
+
+    sp = 0;
+    while (s[sp] == ' ')
+        sp++;
+    d = sp;
+    while (s[d] >= '0' && s[d] <= '9')
+        d++;
+    if (d > sp && s[d] == '.' &&
+        (s[d + 1] == ' ' || s[d + 1] == '\t'))
+    {
+        *indent = sp / 2;
+        *numstart = s + sp;
+        *numlen = (size_t)(d - sp);
+        s += d + 1;
+        while (*s == ' ' || *s == '\t')
+            s++;
+        *content = s;
+        return 1;
+    }
+    return 0;
+}
+
+static int
+md_parse_quote(const char *s, const char **content)
+{
+    while (*s == ' ')
+        s++;
+    if (*s != '>')
+        return 0;
+    s++;
+    if (*s == ' ' || *s == '\t')
+        s++;
+    *content = s;
+    return 1;
+}
+
+static int
+md_is_fence(const char *s)
+{
+    while (*s == ' ' || *s == '\t')
+        s++;
+    return s[0] == '`' && s[1] == '`' && s[2] == '`';
+}
+
+static int
+md_is_table_sep(const char *s)
+{
+    int dash;
+
+    dash = 0;
+    while (*s != '\0')
+    {
+        if (*s == '-')
+            dash++;
+        else if (*s != '|' && *s != ':' &&
+                 *s != ' ' && *s != '\t')
+            return 0;
+        s++;
+    }
+    return dash > 0;
+}
+
+static int
+md_cell_align(const char *cell)
+{
+    const char *p;
+    const char *e;
+    int left;
+    int right;
+
+    p = cell;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    e = p + strlen(p);
+    while (e > p && (*(e - 1) == ' ' || *(e - 1) == '\t'))
+        e--;
+    if (e - p < 3)
+        return 0;
+    left = (*p == ':');
+    right = (*(e - 1) == ':');
+    if (left && right)
+        return 1;
+    if (right)
+        return 2;
+    return 0;
+}
+
+/* Split "| a | b |" into NUL-terminated copies. Returns ncol. */
+static int
+md_split_row(const char *line, char cells[MD_MAX_COLS][1024])
+{
+    const char *p;
+    const char *e;
+    int ncol;
+
+    ncol = 0;
+    p = line;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    e = p + strlen(p);
+    while (e > p && (*(e - 1) == ' ' || *(e - 1) == '\t' ||
+                     *(e - 1) == '\r'))
+        e--;
+    if (e > p && *p == '|')
+        p++;
+    if (e > p && *(e - 1) == '|')
+        e--;
+    while (p < e && ncol < MD_MAX_COLS)
+    {
+        const char *q;
+        const char *qe;
+        size_t len;
+
+        q = p;
+        while (p < e && *p != '|')
+            p++;
+        qe = p;
+        while (q < qe && (*q == ' ' || *q == '\t'))
+            q++;
+        while (qe > q && (*(qe - 1) == ' ' || *(qe - 1) == '\t'))
+            qe--;
+        len = (size_t)(qe - q);
+        if (len > 1023)
+            len = 1023;
+        memcpy(cells[ncol], q, len);
+        cells[ncol][len] = '\0';
+        ncol++;
+        if (p < e && *p == '|')
+            p++;
+        while (p < e && (*p == ' ' || *p == '\t'))
+        {
+            /* keep single pass, trim happens per cell */
+            break;
+        }
+    }
+    return ncol;
+}
+
+static int
+md_inline_to_rtf(StrBuf *out, const char *s)
+{
+    int bold;
+    int italic;
+    int mono;
+    size_t i;
+    size_t n;
+
+    bold = 0;
+    italic = 0;
+    mono = 0;
+    n = strlen(s);
+    i = 0;
+    while (i < n)
+    {
+        char c;
+        unsigned char uc;
+
+        c = s[i];
+        uc = (unsigned char)c;
+        if (mono)
+        {
+            if (c == '`')
+            {
+                mono = 0;
+                if (!sb_append_str(out, "\\f0 "))
+                    return 0;
+                i++;
+            }
+            else if (c == '\\' && i + 1 < n &&
+                     (s[i + 1] == '`' || s[i + 1] == '\\'))
+            {
+                if (!rtf_append_text(out, s + i + 1, 1))
+                    return 0;
+                i += 2;
+            }
+            else if (uc < 0x80)
+            {
+                if (!rtf_append_text(out, s + i, 1))
+                    return 0;
+                i++;
+            }
+            else
+            {
+                unsigned long cp;
+                int nb;
+
+                if (utf8_decode((const unsigned char *)s + i, n - i,
+                                &cp, &nb))
+                {
+                    if (!rtf_append_codepoint(out, cp))
+                        return 0;
+                    i += (size_t)nb;
+                }
+                else
+                {
+                    if (!sb_append_char(out, '?'))
+                        return 0;
+                    i++;
+                }
+            }
+        }
+        else if (c == '\\' && i + 1 < n &&
+                 strchr("*_`[]\\#.!|>", s[i + 1]) != NULL)
+        {
+            if (!rtf_append_text(out, s + i + 1, 1))
+                return 0;
+            i += 2;
+        }
+        else if (c == '`')
+        {
+            mono = 1;
+            if (!sb_append_str(out, "\\f1 "))
+                return 0;
+            i++;
+        }
+        else if (c == '*' || c == '_')
+        {
+            if (i + 1 < n && s[i + 1] == c)
+            {
+                bold = !bold;
+                if (!sb_append_str(out, bold ? "\\b " : "\\b0 "))
+                    return 0;
+                i += 2;
+            }
+            else
+            {
+                if (c == '_' && i > 0 && i + 1 < n &&
+                    isalnum((unsigned char)s[i - 1]) &&
+                    isalnum((unsigned char)s[i + 1]))
+                {
+                    if (!rtf_append_text(out, "_", 1))
+                        return 0;
+                    i++;
+                }
+                else
+                {
+                    italic = !italic;
+                    if (!sb_append_str(out, italic ? "\\i " : "\\i0 "))
+                        return 0;
+                    i++;
+                }
+            }
+        }
+        else if (c == '!' && i + 1 < n && s[i + 1] == '[')
+        {
+            const char *t;
+            const char *u;
+            const char *ve;
+            size_t tlen;
+            size_t ulen;
+
+            t = s + i + 2;
+            u = strchr(t, ']');
+            if (u != NULL && *(u + 1) == '(')
+            {
+                ve = strchr(u + 2, ')');
+                if (ve != NULL)
+                {
+                    tlen = (size_t)(u - t);
+                    ulen = (size_t)(ve - (u + 2));
+                    if (!sb_append_str(out,
+                        "{\\field{\\*\\fldinst HYPERLINK \""))
+                        return 0;
+                    if (!rtf_append_field_url(out, u + 2, ulen))
+                        return 0;
+                    if (!sb_append_str(out,
+                        "\"}{\\fldrslt \\ul\\cf1 "))
+                        return 0;
+                    if (!rtf_append_text(out, t, tlen))
+                        return 0;
+                    if (!sb_append_str(out, "}}"))
+                        return 0;
+                    i = (size_t)(ve - s) + 1;
+                    continue;
+                }
+            }
+            if (!rtf_append_text(out, "!", 1))
+                return 0;
+            i++;
+        }
+        else if (c == '[')
+        {
+            const char *u;
+            const char *ve;
+            size_t tlen;
+            size_t ulen;
+
+            u = strchr(s + i, ']');
+            if (u != NULL && *(u + 1) == '(')
+            {
+                ve = strchr(u + 2, ')');
+                if (ve != NULL)
+                {
+                    tlen = (size_t)(u - (s + i + 1));
+                    ulen = (size_t)(ve - (u + 2));
+                    if (!sb_append_str(out,
+                        "{\\field{\\*\\fldinst HYPERLINK \""))
+                        return 0;
+                    if (!rtf_append_field_url(out, u + 2, ulen))
+                        return 0;
+                    if (!sb_append_str(out,
+                        "\"}{\\fldrslt \\ul\\cf1 "))
+                        return 0;
+                    if (!rtf_append_text(out, s + i + 1, tlen))
+                        return 0;
+                    if (!sb_append_str(out, "}}"))
+                        return 0;
+                    i = (size_t)(ve - s) + 1;
+                    continue;
+                }
+            }
+            if (!rtf_append_text(out, "[", 1))
+                return 0;
+            i++;
+        }
+        else if (uc < 0x80)
+        {
+            if (!rtf_append_text(out, s + i, 1))
+                return 0;
+            i++;
+        }
+        else
+        {
+            unsigned long cp;
+            int nb;
+
+            if (utf8_decode((const unsigned char *)s + i, n - i, &cp, &nb))
+            {
+                if (!rtf_append_codepoint(out, cp))
+                    return 0;
+                i += (size_t)nb;
+            }
+            else
+            {
+                if (!sb_append_char(out, '?'))
+                    return 0;
+                i++;
+            }
+        }
+    }
+    if (mono)
+    {
+        if (!sb_append_str(out, "\\f0 "))
+            return 0;
+    }
+    if (bold)
+    {
+        if (!sb_append_str(out, "\\b0 "))
+            return 0;
+    }
+    if (italic)
+    {
+        if (!sb_append_str(out, "\\i0 "))
+            return 0;
+    }
+    return 1;
+}
+
+static int
+md_emit_table(StrBuf *out, char rows[MD_MAX_ROWS][2048],
+              int nrows, int aligns[MD_MAX_COLS], int ncols)
+{
+    int r;
+    int c;
+    int cellx;
+
+    r = 0;
+    while (r < nrows)
+    {
+        char cells[MD_MAX_COLS][1024];
+        int nc;
+        int k;
+
+        nc = md_split_row(rows[r], cells);
+        if (nc > ncols)
+            nc = ncols;
+        if (!sb_append_str(out, "\\pard\\trowd\\trgaph60\\trleft0"))
+            return 0;
+        k = 0;
+        while (k < ncols)
+        {
+            char tmp[64];
+
+            cellx = (k + 1) * 9000 / ncols;
+            sprintf(tmp, "\\cellx%d", cellx);
+            if (!sb_append_str(out, tmp))
+                return 0;
+            k++;
+        }
+        if (!sb_append_str(out, " "))
+            return 0;
+        c = 0;
+        while (c < ncols)
+        {
+            if (aligns[c] == 1)
+            {
+                if (!sb_append_str(out, "\\qc"))
+                    return 0;
+            }
+            else if (aligns[c] == 2)
+            {
+                if (!sb_append_str(out, "\\qr"))
+                    return 0;
+            }
+            else
+            {
+                if (!sb_append_str(out, "\\ql"))
+                    return 0;
+            }
+            if (!sb_append_str(out, "\\intbl "))
+                return 0;
+            if (r == 0)
+            {
+                if (!sb_append_str(out, "\\b "))
+                    return 0;
+            }
+            if (c < nc)
+            {
+                /* Header is already bold via outer \b; strip redundant
+                   surrounding ** to avoid toggle cancel + flip-flop. */
+                if (r == 0)
+                {
+                    size_t cl;
+
+                    cl = strlen(cells[c]);
+                    if (cl >= 4 &&
+                        cells[c][0] == '*' && cells[c][1] == '*' &&
+                        cells[c][cl - 1] == '*' &&
+                        cells[c][cl - 2] == '*')
+                    {
+                        cells[c][cl - 2] = '\0';
+                        if (!md_inline_to_rtf(out, cells[c] + 2))
+                            return 0;
+                    }
+                    else
+                    {
+                        if (!md_inline_to_rtf(out, cells[c]))
+                            return 0;
+                    }
+                }
+                else
+                {
+                    if (!md_inline_to_rtf(out, cells[c]))
+                        return 0;
+                }
+            }
+            if (r == 0)
+            {
+                if (!sb_append_str(out, "\\b0 "))
+                    return 0;
+            }
+            if (!sb_append_str(out, "\\cell "))
+                return 0;
+            c++;
+        }
+        if (!sb_append_str(out, "\\row "))
+            return 0;
+        r++;
+    }
+    if (!sb_append_str(out, "\\pard "))
+        return 0;
+    return 1;
+}
+
+static char *
+md_to_rtf(const char *md)
+{
+    StrBuf out;
+    size_t mdlen;
+    size_t pos;
+    int in_fence;
+    static const int hsize[7] = { 0, 48, 36, 28, 24, 22, 20 };
+
+    sb_init(&out);
+    if (!sb_append_str(&out,
+        "{\\rtf1\\ansi\\deff0"
+        "{\\fonttbl{\\f0 Arial;}{\\f1 Courier New;}}"
+        "{\\colortbl ;\\red0\\green0\\blue255;}"
+        "\\pard\\fs20 "))
+        return NULL;
+
+    if (md == NULL)
+        md = "";
+    mdlen = strlen(md);
+    pos = 0;
+    in_fence = 0;
+
+    while (pos < mdlen)
+    {
+        size_t eol;
+        size_t len;
+        char *line;
+        const char *content;
+        int level;
+        int indent;
+        int ok;
+
+        eol = pos;
+        while (eol < mdlen && md[eol] != '\n' && md[eol] != '\r')
+            eol++;
+        len = eol - pos;
+        line = (char *)malloc(len + 1);
+        if (line == NULL)
+        {
+            sb_free(&out);
+            return NULL;
+        }
+        if (len > 0)
+            memcpy(line, md + pos, len);
+        line[len] = '\0';
+        if (eol < mdlen && md[eol] == '\r' &&
+            eol + 1 < mdlen && md[eol + 1] == '\n')
+            pos = eol + 2;
+        else if (eol < mdlen)
+            pos = eol + 1;
+        else
+            pos = eol;
+
+        if (md_is_fence(line))
+        {
+            in_fence = !in_fence;
+            free(line);
+            continue;
+        }
+        if (in_fence)
+        {
+            ok = sb_append_str(&out, "\\pard\\li200\\f1\\fs20 ") &&
+                 rtf_append_text(&out, line, strlen(line)) &&
+                 sb_append_str(&out, "\\f0\\par ");
+            free(line);
+            if (!ok)
+            {
+                sb_free(&out);
+                return NULL;
+            }
+            continue;
+        }
+        if (md_is_blank(line))
+        {
+            free(line);
+            if (!sb_append_str(&out, "\\par "))
+            {
+                sb_free(&out);
+                return NULL;
+            }
+            continue;
+        }
+        /* Table? line has '|' and next line is separator. */
+        if (strchr(line, '|') != NULL)
+        {
+            size_t p2;
+            size_t q2;
+            char *sepline;
+
+            p2 = pos;
+            q2 = p2;
+            while (q2 < mdlen && md[q2] != '\n' && md[q2] != '\r')
+                q2++;
+            if (q2 > p2)
+            {
+                sepline = (char *)malloc(q2 - p2 + 1);
+                if (sepline != NULL)
+                {
+                    char trows[MD_MAX_ROWS][2048];
+                    char seps[MD_MAX_COLS][1024];
+                    int aligns[MD_MAX_COLS];
+                    int ncols;
+                    int nrows;
+                    int k;
+
+                    memcpy(sepline, md + p2, q2 - p2);
+                    sepline[q2 - p2] = '\0';
+                    if (md_is_table_sep(sepline))
+                    {
+                        ncols = md_split_row(line, seps);
+                        if (ncols < 1)
+                            ncols = 1;
+                        if (ncols > MD_MAX_COLS)
+                            ncols = MD_MAX_COLS;
+                        k = 0;
+                        while (k < ncols)
+                        {
+                            aligns[k] = md_cell_align(seps[k]);
+                            k++;
+                        }
+                        nrows = 0;
+                        if (strlen(line) < 2048)
+                        {
+                            strcpy(trows[0], line);
+                            nrows = 1;
+                        }
+                        pos = q2;
+                        if (pos < mdlen && md[pos] == '\r' &&
+                            pos + 1 < mdlen && md[pos + 1] == '\n')
+                            pos += 2;
+                        else if (pos < mdlen &&
+                                 (md[pos] == '\n' || md[pos] == '\r'))
+                            pos++;
+                        while (pos < mdlen && nrows < MD_MAX_ROWS)
+                        {
+                            size_t r2;
+                            size_t rq;
+
+                            r2 = pos;
+                            rq = r2;
+                            while (rq < mdlen &&
+                                   md[rq] != '\n' && md[rq] != '\r')
+                                rq++;
+                            if (rq == r2)
+                                break;
+                            {
+                                char *rl;
+
+                                rl = (char *)malloc(rq - r2 + 1);
+                                if (rl == NULL)
+                                    break;
+                                memcpy(rl, md + r2, rq - r2);
+                                rl[rq - r2] = '\0';
+                                if (md_is_blank(rl) ||
+                                    md_is_fence(rl) ||
+                                    strchr(rl, '|') == NULL)
+                                {
+                                    free(rl);
+                                    break;
+                                }
+                                if (strlen(rl) >= 2048)
+                                {
+                                    free(rl);
+                                    break;
+                                }
+                                strcpy(trows[nrows], rl);
+                                nrows++;
+                                free(rl);
+                                pos = rq;
+                                if (pos < mdlen && md[pos] == '\r' &&
+                                    pos + 1 < mdlen &&
+                                    md[pos + 1] == '\n')
+                                    pos += 2;
+                                else if (pos < mdlen &&
+                                         (md[pos] == '\n' ||
+                                          md[pos] == '\r'))
+                                    pos++;
+                            }
+                        }
+                        free(line);
+                        free(sepline);
+                        if (nrows >= 1)
+                        {
+                            if (!md_emit_table(&out, trows, nrows,
+                                               aligns, ncols))
+                            {
+                                sb_free(&out);
+                                return NULL;
+                            }
+                            continue;
+                        }
+                        /* fall through as normal paragraph */
+                        /* rebuild line handling below is skipped;
+                           re-emit header as paragraph */
+                        if (!sb_append_str(&out, "\\pard ") ||
+                            !md_inline_to_rtf(&out, trows[0]) ||
+                            !sb_append_str(&out, "\\par "))
+                        {
+                            sb_free(&out);
+                            return NULL;
+                        }
+                        continue;
+                    }
+                    free(sepline);
+                }
+            }
+        }
+        level = md_heading(line, &content);
+        if (level > 0)
+        {
+            char tmp[64];
+
+            sprintf(tmp, "\\pard\\sb120\\sa60\\b\\fs%d ",
+                    hsize[level]);
+            ok = sb_append_str(&out, tmp) &&
+                 md_inline_to_rtf(&out, content) &&
+                 sb_append_str(&out, "\\b0\\fs20\\par ");
+            free(line);
+            if (!ok)
+            {
+                sb_free(&out);
+                return NULL;
+            }
+            continue;
+        }
+        if (md_is_hrule(line))
+        {
+            free(line);
+            if (!sb_append_str(&out,
+                "\\pard\\qc\\emdash\\emdash\\emdash\\par\\pard "))
+            {
+                sb_free(&out);
+                return NULL;
+            }
+            continue;
+        }
+        if (md_parse_quote(line, &content))
+        {
+            ok = sb_append_str(&out, "\\pard\\li720 ") &&
+                 sb_append_str(&out, "> ") &&
+                 md_inline_to_rtf(&out, content) &&
+                 sb_append_str(&out, "\\par ");
+            free(line);
+            if (!ok)
+            {
+                sb_free(&out);
+                return NULL;
+            }
+            continue;
+        }
+        {
+            const char *c2;
+
+            if (md_parse_ul(line, &indent, &c2))
+            {
+                char tmp[64];
+                int li;
+
+                if (indent > 4)
+                    indent = 4;
+                li = 360 + indent * 360;
+                sprintf(tmp, "\\pard\\li%d\\fi-360 ", li);
+                ok = sb_append_str(&out, tmp) &&
+                     sb_append_str(&out, "\\u8226? ") &&
+                     md_inline_to_rtf(&out, c2) &&
+                     sb_append_str(&out, "\\par ");
+                free(line);
+                if (!ok)
+                {
+                    sb_free(&out);
+                    return NULL;
+                }
+                continue;
+            }
+        }
+        {
+            const char *c2;
+            const char *ns;
+            size_t nl;
+            char numbuf[32];
+            size_t nn;
+
+            if (md_parse_ol(line, &indent, &c2, &ns, &nl))
+            {
+                char tmp[64];
+                int li;
+
+                if (indent > 4)
+                    indent = 4;
+                li = 360 + indent * 360;
+                nn = nl < 30 ? nl : 30;
+                memcpy(numbuf, ns, nn);
+                numbuf[nn] = '\0';
+                sprintf(tmp, "\\pard\\li%d\\fi-360 ", li);
+                ok = sb_append_str(&out, tmp) &&
+                     rtf_append_text(&out, numbuf, nn) &&
+                     sb_append_str(&out, ". ") &&
+                     md_inline_to_rtf(&out, c2) &&
+                     sb_append_str(&out, "\\par ");
+                free(line);
+                if (!ok)
+                {
+                    sb_free(&out);
+                    return NULL;
+                }
+                continue;
+            }
+        }
+        if ((line[0] == ' ' && line[1] == ' ' &&
+             line[2] == ' ' && line[3] == ' ') || line[0] == '\t')
+        {
+            const char *c2;
+
+            c2 = line[0] == '\t' ? line + 1 : line + 4;
+            ok = sb_append_str(&out, "\\pard\\li200\\f1\\fs20 ") &&
+                 rtf_append_text(&out, c2, strlen(c2)) &&
+                 sb_append_str(&out, "\\f0\\par ");
+            free(line);
+            if (!ok)
+            {
+                sb_free(&out);
+                return NULL;
+            }
+            continue;
+        }
+        ok = sb_append_str(&out, "\\pard ") &&
+             md_inline_to_rtf(&out, line) &&
+             sb_append_str(&out, "\\par ");
+        free(line);
+        if (!ok)
+        {
+            sb_free(&out);
+            return NULL;
+        }
+    }
+
+    if (!sb_append_str(&out, "}"))
+    {
+        sb_free(&out);
+        return NULL;
+    }
+    if (out.data == NULL)
+    {
+        out.data = (char *)malloc(1);
+        if (out.data == NULL)
+            return NULL;
+        out.data[0] = '\0';
+    }
+    return out.data;
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * RTF -> Markdown (restricted subset, C89)
+ * ----------------------------------------------------------------------
+ */
+
+#define RTF_MAX_DEPTH 32
+#define RTF_MAX_CELLS 16
+
+typedef struct
+{
+    int ignore;
+    int is_field;
+} RtfGroup;
+
+typedef struct
+{
+    StrBuf md;
+    StrBuf para;
+    int p_bold;
+    int p_italic;
+    int p_mono;
+    int cur_bold;
+    int cur_italic;
+    int cur_mono;
+    int cur_fs;
+    int para_first_fs;
+    int para_first_mono;
+    int para_has_nonmono;
+    int para_has_text;
+    int prev_block;
+    int in_row;
+    int table_first;
+    StrBuf cells[RTF_MAX_CELLS];
+    int cell_idx;
+    int field_depth;
+    int in_field;
+    int in_fldinst;
+    int in_fldrslt;
+    int fldinst_depth;
+    int fldrslt_depth;
+    StrBuf fld_url;
+    StrBuf fld_result;
+    RtfGroup stack[RTF_MAX_DEPTH];
+    int depth;
+} RtfParse;
+
+static unsigned long
+win1252_to_unicode(unsigned char b)
+{
+    static const unsigned long tab[32] = {
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+        0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+        0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+        0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
+    };
+
+    if (b < 0x80)
+        return (unsigned long)b;
+    if (b < 0xA0)
+        return tab[b - 0x80];
+    return (unsigned long)b;
+}
+
+static int
+md_needs_escape(char c)
+{
+    /* Minimal set: escaping more (e.g. '.', '#', '-', '>') is correct
+       for literals but noisy and breaks our own list/quote/heading
+       detection which runs on escaped text. Plain "- ", "# ", "> ",
+       "1. " are structural in markdown anyway. */
+    if (c == '\\' || c == '`' || c == '*' || c == '_' ||
+        c == '[' || c == ']' ||
+        c == '(' || c == ')' || c == '|')
+        return 1;
+    return 0;
+}
+
+static int
+md_append_codepoint(StrBuf *out, unsigned long cp)
+{
+    char tmp[5];
+    int nb;
+
+    if (cp == 0)
+        return 1;
+    if (cp < 0x80)
+    {
+        char c;
+
+        c = (char)cp;
+        if (md_needs_escape(c))
+        {
+            if (!sb_append_char(out, '\\'))
+                return 0;
+        }
+        return sb_append_char(out, c);
+    }
+    nb = utf8_encode(cp, tmp);
+    tmp[nb] = '\0';
+    return sb_append_n(out, tmp, (size_t)nb);
+}
+
+static StrBuf *
+rtf_target(RtfParse *st)
+{
+    if (st->in_field && st->in_fldrslt)
+        return &st->fld_result;
+    if (st->in_row)
+    {
+        if (st->cell_idx < 0)
+            st->cell_idx = 0;
+        if (st->cell_idx >= RTF_MAX_CELLS)
+            st->cell_idx = RTF_MAX_CELLS - 1;
+        return &st->cells[st->cell_idx];
+    }
+    return &st->para;
+}
+
+static int
+rtf_toggle_bold(RtfParse *st, int on)
+{
+    StrBuf *t;
+
+    if (st->in_field && st->in_fldrslt)
+        return 1;
+    if (st->depth > 0 && st->stack[st->depth - 1].ignore)
+        return 1;
+    st->cur_bold = on;
+    t = rtf_target(st);
+    if (t == &st->para || t != &st->fld_result)
+    {
+        if (on && !st->p_bold)
+        {
+            st->p_bold = 1;
+            if (!sb_append_str(t, "**"))
+                return 0;
+        }
+        else if (!on && st->p_bold)
+        {
+            st->p_bold = 0;
+            if (!sb_append_str(t, "**"))
+                return 0;
+        }
+    }
+    return 1;
+}
+
+static int
+rtf_toggle_italic(RtfParse *st, int on)
+{
+    StrBuf *t;
+
+    if (st->in_field && st->in_fldrslt)
+        return 1;
+    if (st->depth > 0 && st->stack[st->depth - 1].ignore)
+        return 1;
+    st->cur_italic = on;
+    t = rtf_target(st);
+    if (on && !st->p_italic)
+    {
+        st->p_italic = 1;
+        if (!sb_append_str(t, "*"))
+            return 0;
+    }
+    else if (!on && st->p_italic)
+    {
+        st->p_italic = 0;
+        if (!sb_append_str(t, "*"))
+            return 0;
+    }
+    return 1;
+}
+
+static int
+rtf_toggle_mono(RtfParse *st, int on)
+{
+    StrBuf *t;
+
+    if (st->in_field && st->in_fldrslt)
+        return 1;
+    if (st->depth > 0 && st->stack[st->depth - 1].ignore)
+        return 1;
+    st->cur_mono = on;
+    t = rtf_target(st);
+    if (on && !st->p_mono)
+    {
+        st->p_mono = 1;
+        if (!sb_append_str(t, "`"))
+            return 0;
+    }
+    else if (!on && st->p_mono)
+    {
+        st->p_mono = 0;
+        if (!sb_append_str(t, "`"))
+            return 0;
+    }
+    return 1;
+}
+
+static int
+rtf_append_plain(RtfParse *st, const char *s, size_t n)
+{
+    StrBuf *t;
+    size_t i;
+
+    if (st->depth > 0 && st->stack[st->depth - 1].ignore)
+        return 1;
+    if (st->in_field && st->in_fldinst)
+    {
+        /* URL capture happens in caller for fldinst text. */
+        return 1;
+    }
+    t = rtf_target(st);
+    i = 0;
+    while (i < n)
+    {
+        unsigned char c;
+        unsigned long cp;
+        int nb;
+
+        c = (unsigned char)s[i];
+        if (c < 0x80)
+        {
+            cp = c;
+            nb = 1;
+        }
+        else
+        {
+            if (!utf8_decode((const unsigned char *)s + i, n - i,
+                             &cp, &nb))
+            {
+                cp = '?';
+                nb = 1;
+            }
+        }
+        if (t == &st->para && !st->para_has_text)
+        {
+            if (cp != ' ' && cp != '\t')
+            {
+                st->para_has_text = 1;
+                st->para_first_fs = st->cur_fs;
+                st->para_first_mono = st->cur_mono;
+                st->para_has_nonmono = !st->cur_mono;
+            }
+        }
+        else if (t == &st->para && st->para_has_text && !st->cur_mono)
+        {
+            st->para_has_nonmono = 1;
+        }
+        if (!md_append_codepoint(t, cp))
+            return 0;
+        i += (size_t)nb;
+    }
+    return 1;
+}
+
+static void
+rtf_close_markers(StrBuf *t, RtfParse *st)
+{
+    if (st->p_mono)
+    {
+        sb_append_str(t, "`");
+        st->p_mono = 0;
+    }
+    if (st->p_bold)
+    {
+        sb_append_str(t, "**");
+        st->p_bold = 0;
+    }
+    if (st->p_italic)
+    {
+        sb_append_str(t, "*");
+        st->p_italic = 0;
+    }
+}
+
+static int
+rtf_is_blank_buf(const char *s)
+{
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+        s++;
+    return *s == '\0';
+}
+
+static void
+rtf_trim_inplace(char *s)
+{
+    char *e;
+
+    while (*s == ' ' || *s == '\t')
+        s++;
+    /* caller trims leading by moving pointer; here trim trailing */
+    e = s + strlen(s);
+    while (e > s && (*(e - 1) == ' ' || *(e - 1) == '\t' ||
+                     *(e - 1) == '\r' || *(e - 1) == '\n'))
+        e--;
+    *e = '\0';
+}
+
+static int
+rtf_flush_para(RtfParse *st)
+{
+    char *txt;
+    size_t len;
+
+    if (st->in_row)
+    {
+        /* \par inside a table cell: treat as space. */
+        if (st->cell_idx >= 0 && st->cell_idx < RTF_MAX_CELLS)
+            sb_append_char(&st->cells[st->cell_idx], ' ');
+        return 1;
+    }
+    rtf_close_markers(&st->para, st);
+    st->cur_bold = 0;
+    st->cur_italic = 0;
+    st->cur_mono = 0;
+    if (st->para.data == NULL || st->para.len == 0)
+    {
+        sb_append_char(&st->md, '\n');
+        st->prev_block = 7;
+        return 1;
+    }
+    txt = st->para.data;
+    /* trim trailing spaces/newlines for detection, keep leading */
+    len = strlen(txt);
+    while (len > 0 && (txt[len - 1] == ' ' || txt[len - 1] == '\t'))
+    {
+        txt[len - 1] = '\0';
+        len--;
+    }
+    if (rtf_is_blank_buf(txt))
+    {
+        st->para.len = 0;
+        if (st->para.data != NULL)
+            st->para.data[0] = '\0';
+        st->para_has_text = 0;
+        sb_append_char(&st->md, '\n');
+        st->prev_block = 7;
+        return 1;
+    }
+    /* code block? all mono: "`...`" */
+    if (st->para_has_text && st->para_first_mono && !st->para_has_nonmono)
+    {
+        char *body;
+
+        body = txt;
+        if (body[0] == '`')
+            body++;
+        len = strlen(body);
+        while (len > 0 && (body[len - 1] == '`' || body[len - 1] == ' ' ||
+                           body[len - 1] == '\t'))
+        {
+            body[len - 1] = '\0';
+            len--;
+        }
+        while (*body == ' ' || *body == '\t')
+            body++;
+        if (st->prev_block != 3 && st->prev_block != 0 && st->prev_block != 7)
+            sb_append_char(&st->md, '\n');
+        sb_append_str(&st->md, "    ");
+        sb_append_str(&st->md, body);
+        sb_append_char(&st->md, '\n');
+        st->prev_block = 3;
+    }
+    else if (txt[0] == '>' && (txt[1] == ' ' || txt[1] == '\0'))
+    {
+        if (st->prev_block == 3 || st->prev_block == 6)
+            sb_append_char(&st->md, '\n');
+        sb_append_str(&st->md, txt);
+        sb_append_char(&st->md, '\n');
+        st->prev_block = 5;
+    }
+    else if ((txt[0] == '-' && txt[1] == ' ') ||
+             (txt[0] == '+' && txt[1] == ' ') ||
+             ((unsigned char)txt[0] == 0xE2 &&
+              (unsigned char)txt[1] == 0x80 &&
+              (unsigned char)txt[2] == 0xA2 && txt[3] == ' '))
+    {
+        const char *body;
+
+        if ((unsigned char)txt[0] == 0xE2)
+            body = txt + 4;
+        else
+            body = txt + 2;
+        if (st->prev_block != 2 && st->prev_block != 0 &&
+            st->prev_block != 7)
+            sb_append_char(&st->md, '\n');
+        sb_append_str(&st->md, "- ");
+        sb_append_str(&st->md, body);
+        sb_append_char(&st->md, '\n');
+        st->prev_block = 2;
+    }
+    else if ((txt[0] >= '0' && txt[0] <= '9'))
+    {
+        const char *p;
+        int is_ol;
+
+        p = txt;
+        while (*p >= '0' && *p <= '9')
+            p++;
+        is_ol = (*p == '.' && (*(p + 1) == ' ' || *(p + 1) == '\0'));
+        if (is_ol)
+        {
+            if (st->prev_block != 2 && st->prev_block != 0 &&
+                st->prev_block != 7)
+                sb_append_char(&st->md, '\n');
+            sb_append_str(&st->md, txt);
+            sb_append_char(&st->md, '\n');
+            st->prev_block = 2;
+        }
+        else
+        {
+            if (st->prev_block == 2 || st->prev_block == 3 ||
+                st->prev_block == 6)
+                sb_append_char(&st->md, '\n');
+            sb_append_str(&st->md, txt);
+            sb_append_str(&st->md, "\n\n");
+            st->prev_block = 1;
+        }
+    }
+    else if (st->para_first_fs >= 40)
+    {
+        char *body;
+
+        body = txt;
+        if (body[0] == '*' && body[1] == '*' &&
+            strlen(body) > 4 &&
+            body[strlen(body) - 1] == '*' &&
+            body[strlen(body) - 2] == '*')
+        {
+            body[strlen(body) - 2] = '\0';
+            body += 2;
+        }
+        if (st->prev_block != 0 && st->prev_block != 7)
+            sb_append_char(&st->md, '\n');
+        sb_append_str(&st->md, "# ");
+        sb_append_str(&st->md, body);
+        sb_append_str(&st->md, "\n\n");
+        st->prev_block = 4;
+    }
+    else if (st->para_first_fs >= 30)
+    {
+        char *body;
+
+        body = txt;
+        if (body[0] == '*' && body[1] == '*' &&
+            strlen(body) > 4 &&
+            body[strlen(body) - 1] == '*' &&
+            body[strlen(body) - 2] == '*')
+        {
+            body[strlen(body) - 2] = '\0';
+            body += 2;
+        }
+        if (st->prev_block != 0 && st->prev_block != 7)
+            sb_append_char(&st->md, '\n');
+        if (st->para_first_fs >= 36)
+            sb_append_str(&st->md, "## ");
+        else
+            sb_append_str(&st->md, "### ");
+        sb_append_str(&st->md, body);
+        sb_append_str(&st->md, "\n\n");
+        st->prev_block = 4;
+    }
+    else if (st->para_first_fs >= 23)
+    {
+        char *body;
+
+        body = txt;
+        if (body[0] == '*' && body[1] == '*' &&
+            strlen(body) > 4 &&
+            body[strlen(body) - 1] == '*' &&
+            body[strlen(body) - 2] == '*')
+        {
+            body[strlen(body) - 2] = '\0';
+            body += 2;
+        }
+        if (st->prev_block != 0 && st->prev_block != 7)
+            sb_append_char(&st->md, '\n');
+        sb_append_str(&st->md, "#### ");
+        sb_append_str(&st->md, body);
+        sb_append_str(&st->md, "\n\n");
+        st->prev_block = 4;
+    }
+    else
+    {
+        /* hr? em dashes */
+        if ((strcmp(txt, "\\-\\-\\-") == 0) ||
+            (strcmp(txt, "---") == 0))
+        {
+            sb_append_str(&st->md, "---\n\n");
+            st->prev_block = 8;
+        }
+        else
+        {
+            /* Detect 3 em dashes (each 3 bytes in UTF-8). */
+            if (strlen(txt) == 9 &&
+                (unsigned char)txt[0] == 0xE2 &&
+                (unsigned char)txt[3] == 0xE2 &&
+                (unsigned char)txt[6] == 0xE2)
+            {
+                sb_append_str(&st->md, "---\n\n");
+                st->prev_block = 8;
+            }
+            else
+            {
+                if (st->prev_block == 2 || st->prev_block == 3 ||
+                    st->prev_block == 6)
+                    sb_append_char(&st->md, '\n');
+                sb_append_str(&st->md, txt);
+                sb_append_str(&st->md, "\n\n");
+                st->prev_block = 1;
+            }
+        }
+    }
+    st->para.len = 0;
+    if (st->para.data != NULL)
+        st->para.data[0] = '\0';
+    st->para_has_text = 0;
+    st->para_first_fs = 20;
+    st->para_first_mono = 0;
+    st->para_has_nonmono = 0;
+    return 1;
+}
+
+static int
+rtf_flush_row(RtfParse *st)
+{
+    int i;
+    int last;
+    int c;
+
+    if (!st->in_row)
+        return 1;
+    if (st->cell_idx >= 0 && st->cell_idx < RTF_MAX_CELLS)
+        rtf_close_markers(&st->cells[st->cell_idx], st);
+    st->cur_bold = 0;
+    st->cur_italic = 0;
+    st->cur_mono = 0;
+    last = st->cell_idx;
+    if (last >= RTF_MAX_CELLS)
+        last = RTF_MAX_CELLS - 1;
+    if (last < 0)
+        last = 0;
+    /* trim trailing empty cells from our fixed array: find last non-blank */
+    while (last > 0)
+    {
+        const char *s;
+
+        s = st->cells[last].data != NULL ? st->cells[last].data : "";
+        while (*s == ' ' || *s == '\t')
+            s++;
+        if (*s == '\0')
+            last--;
+        else
+            break;
+    }
+    if (st->prev_block != 6 && st->prev_block != 0 && st->prev_block != 7)
+        sb_append_char(&st->md, '\n');
+    sb_append_char(&st->md, '|');
+    i = 0;
+    while (i <= last)
+    {
+        const char *s;
+
+        s = st->cells[i].data != NULL ? st->cells[i].data : "";
+        while (*s == ' ' || *s == '\t')
+            s++;
+        {
+            char *e;
+
+            e = (char *)s + strlen(s);
+            while (e > s && (*(e - 1) == ' ' || *(e - 1) == '\t'))
+                e--;
+            /* emit trimmed */
+            sb_append_char(&st->md, ' ');
+            if ((size_t)(e - s) == 0)
+                sb_append_char(&st->md, ' ');
+            else
+                sb_append_n(&st->md, s, (size_t)(e - s));
+            sb_append_str(&st->md, " |");
+        }
+        i++;
+    }
+    sb_append_char(&st->md, '\n');
+    if (st->table_first)
+    {
+        sb_append_char(&st->md, '|');
+        c = 0;
+        while (c <= last)
+        {
+            sb_append_str(&st->md, " --- |");
+            c++;
+        }
+        sb_append_char(&st->md, '\n');
+        st->table_first = 0;
+    }
+    st->prev_block = 6;
+    c = 0;
+    while (c < RTF_MAX_CELLS)
+    {
+        st->cells[c].len = 0;
+        if (st->cells[c].data != NULL)
+            st->cells[c].data[0] = '\0';
+        c++;
+    }
+    st->cell_idx = 0;
+    st->in_row = 0;
+    return 1;
+}
+
+static int
+rtf_is_hex(char c)
+{
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
+static int
+rtf_hex_val(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return c - 'A' + 10;
+}
+
+static char *
+rtf_to_md(const char *rtf)
+{
+    RtfParse st;
+    size_t len;
+    size_t i;
+    int c;
+
+    memset(&st, 0, sizeof(st));
+    sb_init(&st.md);
+    sb_init(&st.para);
+    sb_init(&st.fld_url);
+    sb_init(&st.fld_result);
+    c = 0;
+    while (c < RTF_MAX_CELLS)
+    {
+        sb_init(&st.cells[c]);
+        c++;
+    }
+    st.cur_fs = 20;
+    st.para_first_fs = 20;
+    st.cell_idx = 0;
+    st.field_depth = -1;
+    st.depth = 0;
+
+    if (rtf == NULL)
+        rtf = "";
+    len = strlen(rtf);
+    i = 0;
+    while (i < len)
+    {
+        char ch;
+
+        ch = rtf[i];
+        if (ch == '{')
+        {
+            int ign;
+
+            ign = 0;
+            if (st.depth > 0 && st.stack[st.depth - 1].ignore)
+                ign = 1;
+            if (st.depth < RTF_MAX_DEPTH)
+            {
+                st.stack[st.depth].ignore = ign;
+                st.stack[st.depth].is_field = 0;
+                st.depth++;
+            }
+            i++;
+        }
+        else if (ch == '}')
+        {
+            if (st.depth > 0)
+                st.depth--;
+            if (st.in_fldinst && st.depth < st.fldinst_depth)
+                st.in_fldinst = 0;
+            if (st.in_fldrslt && st.depth < st.fldrslt_depth)
+                st.in_fldrslt = 0;
+            if (st.in_field && st.depth < st.field_depth)
+            {
+                /* flush link */
+                if (st.fld_url.len > 0 && st.fld_result.len > 0)
+                {
+                    StrBuf *t;
+
+                    t = rtf_target(&st);
+                    /* temporarily disable field result routing */
+                    st.in_fldrslt = 0;
+                    t = rtf_target(&st);
+                    sb_append_char(t, '[');
+                    sb_append_str(t, st.fld_result.data != NULL ?
+                                       st.fld_result.data : "");
+                    sb_append_str(t, "](");
+                    sb_append_str(t, st.fld_url.data != NULL ?
+                                       st.fld_url.data : "");
+                    sb_append_char(t, ')');
+                    st.in_fldrslt = 0;
+                }
+                else if (st.fld_result.len > 0)
+                {
+                    StrBuf *t;
+
+                    st.in_fldrslt = 0;
+                    t = rtf_target(&st);
+                    sb_append_str(t, st.fld_result.data != NULL ?
+                                       st.fld_result.data : "");
+                }
+                st.in_field = 0;
+                st.in_fldinst = 0;
+                st.in_fldrslt = 0;
+                st.field_depth = -1;
+                st.fld_url.len = 0;
+                if (st.fld_url.data != NULL)
+                    st.fld_url.data[0] = '\0';
+                st.fld_result.len = 0;
+                if (st.fld_result.data != NULL)
+                    st.fld_result.data[0] = '\0';
+            }
+            i++;
+        }
+        else if (ch == '\\')
+        {
+            size_t j;
+            char nc;
+
+            if (i + 1 >= len)
+            {
+                i++;
+                continue;
+            }
+            nc = rtf[i + 1];
+            if (nc == '{' || nc == '}' || nc == '\\')
+            {
+                char tmp[2];
+
+                tmp[0] = nc;
+                tmp[1] = '\0';
+                if (!(st.depth > 0 &&
+                      st.stack[st.depth - 1].ignore))
+                {
+                    if (st.in_field && st.in_fldinst)
+                    {
+                        /* ignore */
+                    }
+                    else if (st.in_field && st.in_fldrslt)
+                    {
+                        sb_append_str(&st.fld_result, tmp);
+                    }
+                    else
+                    {
+                        rtf_append_plain(&st, tmp, 1);
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            if (nc == '\'')
+            {
+                if (i + 3 < len && rtf_is_hex(rtf[i + 2]) &&
+                    rtf_is_hex(rtf[i + 3]))
+                {
+                    unsigned char b;
+                    unsigned long cp;
+                    char ub[5];
+                    int nb;
+
+                    b = (unsigned char)(rtf_hex_val(rtf[i + 2]) * 16 +
+                                        rtf_hex_val(rtf[i + 3]));
+                    cp = win1252_to_unicode(b);
+                    nb = utf8_encode(cp, ub);
+                    if (!(st.depth > 0 &&
+                          st.stack[st.depth - 1].ignore))
+                    {
+                        if (st.in_field && st.in_fldinst)
+                        {
+                        }
+                        else if (st.in_field && st.in_fldrslt)
+                        {
+                            sb_append_n(&st.fld_result, ub, (size_t)nb);
+                        }
+                        else
+                        {
+                            rtf_append_plain(&st, ub, (size_t)nb);
+                        }
+                    }
+                    i += 4;
+                    continue;
+                }
+                i += 2;
+                continue;
+            }
+            /* Single-char controls: \*, \~, \-, \_, \<space>, etc.
+               Consume both chars so '*' etc. don't leak as text. */
+            if (!((nc >= 'a' && nc <= 'z') ||
+                  (nc >= 'A' && nc <= 'Z')))
+            {
+                if (nc == '~')
+                {
+                    if (!(st.depth > 0 &&
+                          st.stack[st.depth - 1].ignore) &&
+                        !(st.in_field && st.in_fldinst))
+                    {
+                        if (st.in_field && st.in_fldrslt)
+                            sb_append_char(&st.fld_result, ' ');
+                        else
+                            rtf_append_plain(&st, " ", 1);
+                    }
+                }
+                else if (nc == '_')
+                {
+                    if (!(st.depth > 0 &&
+                          st.stack[st.depth - 1].ignore) &&
+                        !(st.in_field && st.in_fldinst))
+                    {
+                        if (st.in_field && st.in_fldrslt)
+                            sb_append_char(&st.fld_result, '-');
+                        else
+                            rtf_append_plain(&st, "-", 1);
+                    }
+                }
+                else if (nc == ' ' || nc == '\n' || nc == '\r' ||
+                         nc == '\t')
+                {
+                    if (!(st.depth > 0 &&
+                          st.stack[st.depth - 1].ignore) &&
+                        !(st.in_field && st.in_fldinst))
+                    {
+                        if (st.in_field && st.in_fldrslt)
+                            sb_append_char(&st.fld_result, ' ');
+                        else
+                            rtf_append_plain(&st, " ", 1);
+                    }
+                }
+                /* \*, \-, \:, etc.: destination / formatting, ignore. */
+                i += 2;
+                continue;
+            }
+            /* control word */
+            j = i + 1;
+            while (j < len && ((rtf[j] >= 'a' && rtf[j] <= 'z') ||
+                              (rtf[j] >= 'A' && rtf[j] <= 'Z')))
+                j++;
+            {
+                char word[32];
+                size_t wl;
+                long param;
+                int has_param;
+                int neg;
+
+                wl = j - (i + 1);
+                if (wl > 31)
+                    wl = 31;
+                memcpy(word, rtf + i + 1, wl);
+                word[wl] = '\0';
+                has_param = 0;
+                param = 0;
+                neg = 0;
+                if (j < len && (rtf[j] == '-' ||
+                               (rtf[j] >= '0' && rtf[j] <= '9')))
+                {
+                    has_param = 1;
+                    if (rtf[j] == '-')
+                    {
+                        neg = 1;
+                        j++;
+                    }
+                    param = 0;
+                    while (j < len && rtf[j] >= '0' && rtf[j] <= '9')
+                    {
+                        param = param * 10 + (rtf[j] - '0');
+                        j++;
+                    }
+                    if (neg)
+                        param = -param;
+                }
+                if (j < len && rtf[j] == ' ')
+                    j++;
+                i = j;
+
+                if (strcmp(word, "par") == 0 ||
+                    strcmp(word, "line") == 0)
+                {
+                    rtf_flush_para(&st);
+                }
+                else if (strcmp(word, "row") == 0)
+                {
+                    rtf_flush_row(&st);
+                }
+                else if (strcmp(word, "cell") == 0)
+                {
+                    if (st.in_row)
+                    {
+                        if (st.cell_idx >= 0 &&
+                            st.cell_idx < RTF_MAX_CELLS)
+                            rtf_close_markers(
+                                &st.cells[st.cell_idx], &st);
+                        st.cell_idx++;
+                        if (st.cell_idx >= RTF_MAX_CELLS)
+                            st.cell_idx = RTF_MAX_CELLS - 1;
+                        st.cur_bold = 0;
+                        st.cur_italic = 0;
+                        st.cur_mono = 0;
+                    }
+                }
+                else if (strcmp(word, "trowd") == 0)
+                {
+                    if (!st.in_row)
+                    {
+                        int k;
+
+                        if (st.para.data != NULL && st.para.len > 0)
+                            rtf_flush_para(&st);
+                        st.in_row = 1;
+                        st.cell_idx = 0;
+                        k = 0;
+                        while (k < RTF_MAX_CELLS)
+                        {
+                            st.cells[k].len = 0;
+                            if (st.cells[k].data != NULL)
+                                st.cells[k].data[0] = '\0';
+                            k++;
+                        }
+                        if (st.prev_block != 6)
+                            st.table_first = 1;
+                        st.cur_bold = 0;
+                        st.cur_italic = 0;
+                        st.cur_mono = 0;
+                        st.p_bold = 0;
+                        st.p_italic = 0;
+                        st.p_mono = 0;
+                    }
+                }
+                else if (strcmp(word, "intbl") == 0)
+                {
+                    if (!st.in_row)
+                    {
+                        int k;
+
+                        st.in_row = 1;
+                        st.cell_idx = 0;
+                        k = 0;
+                        while (k < RTF_MAX_CELLS)
+                        {
+                            st.cells[k].len = 0;
+                            if (st.cells[k].data != NULL)
+                                st.cells[k].data[0] = '\0';
+                            k++;
+                        }
+                        if (st.prev_block != 6)
+                            st.table_first = 1;
+                    }
+                }
+                else if (strcmp(word, "b") == 0)
+                {
+                    int on;
+
+                    on = !has_param || param != 0;
+                    rtf_toggle_bold(&st, on);
+                }
+                else if (strcmp(word, "i") == 0)
+                {
+                    int on;
+
+                    on = !has_param || param != 0;
+                    rtf_toggle_italic(&st, on);
+                }
+                else if (strcmp(word, "f") == 0)
+                {
+                    if (has_param && param == 1)
+                        rtf_toggle_mono(&st, 1);
+                    else
+                        rtf_toggle_mono(&st, 0);
+                }
+                else if (strcmp(word, "fs") == 0)
+                {
+                    if (has_param)
+                    {
+                        st.cur_fs = (int)param;
+                        if (!st.para_has_text && !st.in_row &&
+                            !(st.in_field && st.in_fldrslt))
+                            st.para_first_fs = (int)param;
+                    }
+                }
+                else if (strcmp(word, "u") == 0)
+                {
+                    long v;
+                    unsigned long cp;
+                    char ub[5];
+                    int nb;
+
+                    v = has_param ? param : 0;
+                    if (v < 0)
+                        v += 65536;
+                    cp = (unsigned long)v;
+                    nb = utf8_encode(cp, ub);
+                    if (!(st.depth > 0 &&
+                          st.stack[st.depth - 1].ignore))
+                    {
+                        if (st.in_field && st.in_fldinst)
+                        {
+                        }
+                        else if (st.in_field && st.in_fldrslt)
+                        {
+                            sb_append_n(&st.fld_result, ub, (size_t)nb);
+                        }
+                        else
+                        {
+                            rtf_append_plain(&st, ub, (size_t)nb);
+                        }
+                    }
+                    /* skip single fallback char */
+                    if (i < len && rtf[i] != '\\' &&
+                        rtf[i] != '{' && rtf[i] != '}')
+                        i++;
+                }
+                else if (strcmp(word, "tab") == 0)
+                {
+                    rtf_append_plain(&st, " ", 1);
+                }
+                else if (strcmp(word, "emdash") == 0)
+                {
+                    char ub[5];
+
+                    ub[0] = (char)0xE2;
+                    ub[1] = (char)0x80;
+                    ub[2] = (char)0x94;
+                    rtf_append_plain(&st, ub, 3);
+                }
+                else if (strcmp(word, "endash") == 0)
+                {
+                    char ub[5];
+
+                    ub[0] = (char)0xE2;
+                    ub[1] = (char)0x80;
+                    ub[2] = (char)0x93;
+                    rtf_append_plain(&st, ub, 3);
+                }
+                else if (strcmp(word, "bullet") == 0)
+                {
+                    char ub[5];
+
+                    ub[0] = (char)0xE2;
+                    ub[1] = (char)0x80;
+                    ub[2] = (char)0xA2;
+                    rtf_append_plain(&st, ub, 3);
+                }
+                else if (strcmp(word, "lquote") == 0 ||
+                         strcmp(word, "rquote") == 0)
+                {
+                    char ub[5];
+
+                    ub[0] = (char)0xE2;
+                    ub[1] = (char)0x80;
+                    ub[2] = (char)0x99;
+                    rtf_append_plain(&st, ub, 3);
+                }
+                else if (strcmp(word, "ldblquote") == 0 ||
+                         strcmp(word, "rdblquote") == 0)
+                {
+                    char ub[5];
+
+                    ub[0] = (char)0xE2;
+                    ub[1] = (char)0x80;
+                    ub[2] = (char)0x9C;
+                    rtf_append_plain(&st, ub, 3);
+                }
+                else if (strcmp(word, "field") == 0)
+                {
+                    if (st.depth > 0)
+                    {
+                        st.stack[st.depth - 1].is_field = 1;
+                        st.field_depth = st.depth;
+                        st.in_field = 1;
+                        st.in_fldinst = 0;
+                        st.in_fldrslt = 0;
+                        st.fld_url.len = 0;
+                        if (st.fld_url.data != NULL)
+                            st.fld_url.data[0] = '\0';
+                        st.fld_result.len = 0;
+                        if (st.fld_result.data != NULL)
+                            st.fld_result.data[0] = '\0';
+                    }
+                }
+                else if (strcmp(word, "fldinst") == 0)
+                {
+                    st.in_fldinst = 1;
+                    st.fldinst_depth = st.depth;
+                    st.in_fldrslt = 0;
+                }
+                else if (strcmp(word, "fldrslt") == 0)
+                {
+                    st.in_fldrslt = 1;
+                    st.fldrslt_depth = st.depth;
+                    st.in_fldinst = 0;
+                }
+                else if (strcmp(word, "fonttbl") == 0 ||
+                         strcmp(word, "colortbl") == 0 ||
+                         strcmp(word, "stylesheet") == 0 ||
+                         strcmp(word, "info") == 0 ||
+                         strcmp(word, "title") == 0 ||
+                         strcmp(word, "author") == 0)
+                {
+                    if (st.depth > 0)
+                        st.stack[st.depth - 1].ignore = 1;
+                }
+                else if (strcmp(word, "pard") == 0 ||
+                         strcmp(word, "plain") == 0)
+                {
+                    if (st.para.data != NULL && st.para.len > 0 &&
+                        !st.in_row)
+                    {
+                        /* missing \par: flush to avoid mixing */
+                    }
+                    st.cur_bold = 0;
+                    st.cur_italic = 0;
+                    st.cur_mono = 0;
+                    st.cur_fs = 20;
+                    if (!st.para_has_text)
+                        st.para_first_fs = 20;
+                }
+                else
+                {
+                    /* ignore other controls */
+                }
+            }
+        }
+        else if (ch == '\n' || ch == '\r')
+        {
+            i++;
+        }
+        else
+        {
+            size_t j;
+
+            j = i;
+            while (j < len && rtf[j] != '\\' &&
+                   rtf[j] != '{' && rtf[j] != '}' &&
+                   rtf[j] != '\n' && rtf[j] != '\r')
+                j++;
+            if (j > i)
+            {
+                if (!(st.depth > 0 &&
+                      st.stack[st.depth - 1].ignore))
+                {
+                    if (st.in_field && st.in_fldinst)
+                    {
+                        const char *seg;
+                        const char *hl;
+                        size_t seglen;
+
+                        seg = rtf + i;
+                        seglen = j - i;
+                        {
+                            char *tmp;
+
+                            tmp = (char *)malloc(seglen + 1);
+                            if (tmp != NULL)
+                            {
+                                memcpy(tmp, seg, seglen);
+                                tmp[seglen] = '\0';
+                                hl = strstr(tmp, "HYPERLINK");
+                                if (hl != NULL &&
+                                    st.fld_url.len == 0)
+                                {
+                                    const char *q1;
+                                    const char *q2;
+
+                                    q1 = strchr(hl, '"');
+                                    if (q1 != NULL)
+                                    {
+                                        q2 = strchr(q1 + 1, '"');
+                                        if (q2 != NULL &&
+                                            q2 > q1 + 1)
+                                        {
+                                            sb_append_n(&st.fld_url,
+                                                q1 + 1,
+                                                (size_t)(q2 - q1 - 1));
+                                        }
+                                    }
+                                }
+                                free(tmp);
+                            }
+                        }
+                    }
+                    else if (st.in_field && st.in_fldrslt)
+                    {
+                        size_t k;
+
+                        k = i;
+                        while (k < j)
+                        {
+                            unsigned char cc;
+
+                            cc = (unsigned char)rtf[k];
+                            if (cc < 0x80)
+                            {
+                                if (cc == ' ' || cc == '\t')
+                                {
+                                    sb_append_char(&st.fld_result, ' ');
+                                }
+                                else
+                                {
+                                    /* light escape for link text */
+                                    if (md_needs_escape((char)cc) &&
+                                        cc != ' ' && cc != '\t')
+                                    {
+                                        /* link text: keep plain,
+                                           escape [ ] ( ) */
+                                        if (cc == '[' || cc == ']' ||
+                                            cc == '(' || cc == ')' ||
+                                            cc == '\\')
+                                            sb_append_char(
+                                                &st.fld_result, '\\');
+                                    }
+                                    sb_append_char(&st.fld_result,
+                                                   (char)cc);
+                                }
+                                k++;
+                            }
+                            else
+                            {
+                                unsigned long cp;
+                                int nb;
+                                char ub[5];
+                                int wb;
+
+                                if (utf8_decode(
+                                        (const unsigned char *)rtf + k,
+                                        j - k, &cp, &nb))
+                                {
+                                    wb = utf8_encode(cp, ub);
+                                    sb_append_n(&st.fld_result,
+                                                ub, (size_t)wb);
+                                    k += (size_t)nb;
+                                }
+                                else
+                                {
+                                    sb_append_char(&st.fld_result, '?');
+                                    k++;
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        rtf_append_plain(&st, rtf + i, j - i);
+                    }
+                }
+                i = j;
+            }
+            else
+            {
+                i++;
+            }
+        }
+    }
+    if (st.in_row)
+        rtf_flush_row(&st);
+    else
+        rtf_flush_para(&st);
+    {
+        char *res;
+
+        if (st.md.data == NULL)
+        {
+            res = (char *)malloc(1);
+            if (res != NULL)
+                res[0] = '\0';
+        }
+        else
+        {
+            res = st.md.data;
+            st.md.data = NULL;
+        }
+        sb_free(&st.md);
+        sb_free(&st.para);
+        sb_free(&st.fld_url);
+        sb_free(&st.fld_result);
+        c = 0;
+        while (c < RTF_MAX_CELLS)
+        {
+            sb_free(&st.cells[c]);
+            c++;
+        }
+        return res;
+    }
+}
+
+/*
+ * ----------------------------------------------------------------------
+ * Memory streaming + markdown file dispatch
+ * ----------------------------------------------------------------------
+ */
+
+typedef struct
+{
+    const char *buf;
+    LONG len;
+    LONG pos;
+} MemIn;
+
+typedef struct
+{
+    char *buf;
+    LONG len;
+    LONG cap;
+    int failed;
+} MemOut;
+
+static DWORD CALLBACK
+StreamInMemCallback(DWORD_PTR dwCookie, LPBYTE pbBuff,
+                    LONG cb, LONG *pcb)
+{
+    MemIn *m;
+
+    m = (MemIn *)dwCookie;
+    if (m->pos >= m->len)
+    {
+        *pcb = 0;
+        return 0;
+    }
+    if (cb > m->len - m->pos)
+        cb = m->len - m->pos;
+    memcpy(pbBuff, m->buf + m->pos, (size_t)cb);
+    m->pos += cb;
+    *pcb = cb;
+    return 0;
+}
+
+static DWORD CALLBACK
+StreamOutMemCallback(DWORD_PTR dwCookie, LPBYTE pbBuff,
+                     LONG cb, LONG *pcb)
+{
+    MemOut *m;
+    LONG need;
+
+    m = (MemOut *)dwCookie;
+    if (m->failed)
+    {
+        *pcb = 0;
+        return 1;
+    }
+    need = m->len + cb + 1;
+    if (need > m->cap)
+    {
+        LONG newcap;
+        char *nb;
+
+        newcap = m->cap > 0 ? m->cap : 8192;
+        while (newcap < need)
+            newcap *= 2;
+        nb = (char *)realloc(m->buf, (size_t)newcap);
+        if (nb == NULL)
+        {
+            m->failed = 1;
+            *pcb = 0;
+            return 1;
+        }
+        m->buf = nb;
+        m->cap = newcap;
+    }
+    memcpy(m->buf + m->len, pbBuff, (size_t)cb);
+    m->len += cb;
+    m->buf[m->len] = '\0';
+    *pcb = cb;
+    return 0;
+}
+
+static char *
+read_entire_file(const char *path, size_t *out_len)
+{
+    FILE *fp;
+    long sz;
+    size_t len;
+    char *buf;
+    size_t got;
+
+    fp = fopen(path, "rb");
+    if (fp == NULL)
+        return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0)
+    {
+        fclose(fp);
+        return NULL;
+    }
+    sz = ftell(fp);
+    if (sz < 0)
+    {
+        fclose(fp);
+        return NULL;
+    }
+    rewind(fp);
+    len = (size_t)sz;
+    buf = (char *)malloc(len + 1);
+    if (buf == NULL)
+    {
+        fclose(fp);
+        return NULL;
+    }
+    got = fread(buf, 1, len, fp);
+    fclose(fp);
+    buf[got] = '\0';
+    if (out_len != NULL)
+        *out_len = got;
+    return buf;
+}
+
+static int
+write_entire_file(const char *path, const char *data)
+{
+    FILE *fp;
+    size_t len;
+    size_t wrote;
+
+    fp = fopen(path, "wb");
+    if (fp == NULL)
+        return 0;
+    len = strlen(data);
+    wrote = fwrite(data, 1, len, fp);
+    fclose(fp);
+    return wrote == len;
+}
+
+static int
+has_ext_ci(const char *filename, const char *ext)
+{
+    size_t fl;
+    size_t el;
+
+    fl = strlen(filename);
+    el = strlen(ext);
+    if (el >= fl)
+        return 0;
+    filename += fl - el;
+    while (*ext != '\0')
+    {
+        char a;
+        char b;
+
+        a = *filename;
+        b = *ext;
+        if (a >= 'A' && a <= 'Z')
+            a = (char)(a + 32);
+        if (b >= 'A' && b <= 'Z')
+            b = (char)(b + 32);
+        if (a != b)
+            return 0;
+        filename++;
+        ext++;
+    }
+    return 1;
+}
+
+static int
+is_markdown_file(const char *filename)
+{
+    if (has_ext_ci(filename, ".md"))
+        return 1;
+    if (has_ext_ci(filename, ".markdown"))
+        return 1;
+    if (has_ext_ci(filename, ".mkd"))
+        return 1;
+    if (has_ext_ci(filename, ".mdown"))
+        return 1;
+    if (has_ext_ci(filename, ".txt"))
+        return 1;
     return 0;
 }
 
@@ -277,6 +2979,142 @@ SaveRTF(HWND hwndEdit, const char *filename)
     return 1;
 }
 
+static int
+LoadMarkdown(HWND hwndEdit, const char *filename)
+{
+    char *md;
+    char *rtf;
+    MemIn m;
+    EDITSTREAM es;
+
+    md = read_entire_file(filename, NULL);
+    if (md == NULL)
+    {
+        MessageBox(hwndEdit,
+                   "Unable to open the file.",
+                   "Open",
+                   MB_OK | MB_ICONERROR);
+        return 0;
+    }
+    rtf = md_to_rtf(md);
+    free(md);
+    if (rtf == NULL)
+    {
+        MessageBox(hwndEdit,
+                   "Out of memory.",
+                   "Open",
+                   MB_OK | MB_ICONERROR);
+        return 0;
+    }
+    memset(&m, 0, sizeof(m));
+    m.buf = rtf;
+    m.len = (LONG)strlen(rtf);
+    m.pos = 0;
+    memset(&es, 0, sizeof(es));
+    es.dwCookie = (DWORD_PTR)&m;
+    es.pfnCallback = StreamInMemCallback;
+    SendMessage(hwndEdit,
+                EM_STREAMIN,
+                (WPARAM)SF_RTF,
+                (LPARAM)&es);
+    free(rtf);
+    if (es.dwError != 0)
+    {
+        MessageBox(hwndEdit,
+                   "Unable to load the file.",
+                   "Open",
+                   MB_OK | MB_ICONERROR);
+        return 0;
+    }
+    strncpy(g_filename, filename, MAX_PATH - 1);
+    g_filename[MAX_PATH - 1] = '\0';
+    UpdateTitle();
+    return 1;
+}
+
+static int
+SaveMarkdown(HWND hwndEdit, const char *filename)
+{
+    MemOut m;
+    EDITSTREAM es;
+    char *rtf;
+    char *md;
+    int ok;
+
+    memset(&m, 0, sizeof(m));
+    memset(&es, 0, sizeof(es));
+    es.dwCookie = (DWORD_PTR)&m;
+    es.pfnCallback = StreamOutMemCallback;
+    SendMessage(hwndEdit,
+                EM_STREAMOUT,
+                (WPARAM)SF_RTF,
+                (LPARAM)&es);
+    if (es.dwError != 0 || m.failed)
+    {
+        if (m.buf != NULL)
+            free(m.buf);
+        MessageBox(hwndEdit,
+                   "Unable to save the file.",
+                   "Save",
+                   MB_OK | MB_ICONERROR);
+        return 0;
+    }
+    rtf = m.buf != NULL ? m.buf : NULL;
+    if (rtf == NULL)
+    {
+        rtf = (char *)malloc(1);
+        if (rtf == NULL)
+        {
+            MessageBox(hwndEdit,
+                       "Out of memory.",
+                       "Save",
+                       MB_OK | MB_ICONERROR);
+            return 0;
+        }
+        rtf[0] = '\0';
+    }
+    md = rtf_to_md(rtf);
+    free(rtf);
+    if (md == NULL)
+    {
+        MessageBox(hwndEdit,
+                   "Out of memory.",
+                   "Save",
+                   MB_OK | MB_ICONERROR);
+        return 0;
+    }
+    ok = write_entire_file(filename, md);
+    free(md);
+    if (!ok)
+    {
+        MessageBox(hwndEdit,
+                   "Unable to create the file.",
+                   "Save",
+                   MB_OK | MB_ICONERROR);
+        return 0;
+    }
+    strncpy(g_filename, filename, MAX_PATH - 1);
+    g_filename[MAX_PATH - 1] = '\0';
+    UpdateTitle();
+    return 1;
+}
+
+static int
+LoadAny(HWND hwndEdit, const char *filename)
+{
+    if (is_markdown_file(filename))
+        return LoadMarkdown(hwndEdit, filename);
+    return LoadRTF(hwndEdit, filename);
+}
+
+static int
+SaveAny(HWND hwndEdit, const char *filename)
+{
+    if (is_markdown_file(filename))
+        return SaveMarkdown(hwndEdit, filename);
+    return SaveRTF(hwndEdit, filename);
+}
+
 /*
  * ----------------------------------------------------------------------
  * File dialogs
@@ -295,6 +3133,8 @@ Open_File(HWND hwnd)
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
     ofn.lpstrFilter =
+        "Markdown (*.md;*.markdown;*.mkd;*.mdown;*.txt)\0"
+        "*.md;*.markdown;*.mkd;*.mdown;*.txt\0"
         "Rich Text Format (*.rtf)\0*.rtf\0"
         "All Files (*.*)\0*.*\0\0";
     ofn.lpstrFile = filename;
@@ -302,12 +3142,12 @@ Open_File(HWND hwnd)
     ofn.Flags = OFN_FILEMUSTEXIST |
                 OFN_HIDEREADONLY |
                 OFN_PATHMUSTEXIST;
-    ofn.lpstrDefExt = "rtf";
+    ofn.lpstrDefExt = "md";
 
     if (!GetOpenFileName(&ofn))
         return 0;
 
-    return LoadRTF(g_hwndEdit, filename);
+    return LoadAny(g_hwndEdit, filename);
 }
 
 static int
@@ -326,12 +3166,14 @@ SaveAsFile(HWND hwnd)
     }
     else
     {
-        strcpy(filename, "document.rtf");
+        strcpy(filename, "document.md");
     }
 
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
     ofn.lpstrFilter =
+        "Markdown (*.md;*.markdown;*.mkd;*.mdown;*.txt)\0"
+        "*.md;*.markdown;*.mkd;*.mdown;*.txt\0"
         "Rich Text Format (*.rtf)\0*.rtf\0"
         "All Files (*.*)\0*.*\0\0";
     ofn.lpstrFile = filename;
@@ -339,12 +3181,15 @@ SaveAsFile(HWND hwnd)
     ofn.Flags = OFN_OVERWRITEPROMPT |
                 OFN_HIDEREADONLY |
                 OFN_PATHMUSTEXIST;
-    ofn.lpstrDefExt = "rtf";
+    if (is_markdown_file(filename))
+        ofn.lpstrDefExt = "md";
+    else
+        ofn.lpstrDefExt = "rtf";
 
     if (!GetSaveFileName(&ofn))
         return 0;
 
-    return SaveRTF(g_hwndEdit, filename);
+    return SaveAny(g_hwndEdit, filename);
 }
 
 static int
@@ -353,7 +3198,7 @@ SaveFile(HWND hwnd)
     if (g_filename[0] == '\0')
         return SaveAsFile(hwnd);
 
-    return SaveRTF(g_hwndEdit, g_filename);
+    return SaveAny(g_hwndEdit, g_filename);
 }
 
 /*
@@ -413,7 +3258,7 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         {
             g_hwndEdit = CreateWindowEx(
                 WS_EX_CLIENTEDGE,
-                RICHEDIT_CLASSA,
+                g_editClass != NULL ? g_editClass : RICHEDIT_CLASSA,
                 "",
                 WS_CHILD |
                 WS_VISIBLE |
@@ -532,20 +3377,33 @@ WinMain(HINSTANCE hInstance,
     g_hInst = hInstance;
     g_hwndMain = NULL;
     g_hwndEdit = NULL;
+    g_hRichEdit = NULL;
+    g_editClass = NULL;
     g_filename[0] = '\0';
 
     /*
-     * RICHEDIT_CLASSA is supplied by RichEdit 2.0 and later.
+     * Prefer Msftedit (RichEdit 4.1+, best table support) and fall back
+     * to RICHED20 (2.0 on old systems, 3.0+ on XP and later, tables OK).
      *
-     * Loading the DLL explicitly also makes the program work on
-     * systems where the Rich Edit DLL has not yet been loaded.
+     * Msftedit only provides the Unicode RICHEDIT50W class, but byte
+     * based SF_RTF streaming still works from this ANSI app.
      */
-    g_hRichEdit = LoadLibrary("RICHED20.DLL");
+    g_hRichEdit = LoadLibrary("Msftedit.dll");
+
+    if (g_hRichEdit != NULL)
+    {
+        g_editClass = MSFTEDIT_CLASS;
+    }
+    else
+    {
+        g_hRichEdit = LoadLibrary("RICHED20.DLL");
+        g_editClass = RICHEDIT_CLASSA;
+    }
 
     if (g_hRichEdit == NULL)
     {
         MessageBox(NULL,
-                   "Unable to load RICHED20.DLL.",
+                   "Unable to load Msftedit.dll or RICHED20.DLL.",
                    WND_TITLE,
                    MB_OK | MB_ICONERROR);
         return 1;
@@ -596,7 +3454,7 @@ WinMain(HINSTANCE hInstance,
 
     if (GetCmdLineFile(lpCmdLine, cmdFile, MAX_PATH))
     {
-        LoadRTF(g_hwndEdit, cmdFile);
+        LoadAny(g_hwndEdit, cmdFile);
     }
 
     while (GetMessage(&msg, NULL, 0, 0) > 0)
