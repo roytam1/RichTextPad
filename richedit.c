@@ -49,6 +49,7 @@
 #define IDM_COPY        112
 #define IDM_PASTE       113
 #define IDM_SELECTALL   114
+#define IDM_SHOW_SOURCE 115
 
 #define IDC_EDITOR      200
 
@@ -58,6 +59,7 @@ static HWND       g_hwndEdit;
 static HMODULE     g_hRichEdit;
 static const char *g_editClass;
 static char       g_filename[MAX_PATH];
+static int        g_showSource;
 
 /*
  * ----------------------------------------------------------------------
@@ -2893,6 +2895,57 @@ LoadRTF(HWND hwndEdit, const char *filename)
     FILE *fp;
     EDITSTREAM es;
 
+    if (g_showSource)
+    {
+        char *rtf;
+        char *md;
+        MemIn m;
+
+        rtf = read_entire_file(filename, NULL);
+        if (rtf == NULL)
+        {
+            MessageBox(hwndEdit,
+                       "Unable to open the RTF file.",
+                       "Open",
+                       MB_OK | MB_ICONERROR);
+            return 0;
+        }
+        md = rtf_to_md(rtf);
+        free(rtf);
+        if (md == NULL)
+        {
+            MessageBox(hwndEdit,
+                       "Out of memory.",
+                       "Open",
+                       MB_OK | MB_ICONERROR);
+            return 0;
+        }
+        memset(&m, 0, sizeof(m));
+        m.buf = md;
+        m.len = (LONG)strlen(md);
+        m.pos = 0;
+        memset(&es, 0, sizeof(es));
+        es.dwCookie = (DWORD_PTR)&m;
+        es.pfnCallback = StreamInMemCallback;
+        SendMessage(hwndEdit,
+                    EM_STREAMIN,
+                    (WPARAM)SF_TEXT,
+                    (LPARAM)&es);
+        free(md);
+        if (es.dwError != 0)
+        {
+            MessageBox(hwndEdit,
+                       "Unable to load the RTF file.",
+                       "Open",
+                       MB_OK | MB_ICONERROR);
+            return 0;
+        }
+        strncpy(g_filename, filename, MAX_PATH - 1);
+        g_filename[MAX_PATH - 1] = '\0';
+        UpdateTitle();
+        return 1;
+    }
+
     fp = fopen(filename, "rb");
 
     if (fp == NULL)
@@ -2938,6 +2991,73 @@ SaveRTF(HWND hwndEdit, const char *filename)
 {
     FILE *fp;
     EDITSTREAM es;
+
+    if (g_showSource)
+    {
+        MemOut m;
+        char *md;
+        char *rtf;
+
+        memset(&m, 0, sizeof(m));
+        memset(&es, 0, sizeof(es));
+        es.dwCookie = (DWORD_PTR)&m;
+        es.pfnCallback = StreamOutMemCallback;
+        SendMessage(hwndEdit,
+                    EM_STREAMOUT,
+                    (WPARAM)SF_TEXT,
+                    (LPARAM)&es);
+        if (es.dwError != 0 || m.failed)
+        {
+            if (m.buf != NULL)
+                free(m.buf);
+            MessageBox(hwndEdit,
+                       "Unable to save the RTF file.",
+                       "Save",
+                       MB_OK | MB_ICONERROR);
+            return 0;
+        }
+        md = m.buf != NULL ? m.buf : NULL;
+        if (md == NULL)
+        {
+            md = (char *)malloc(1);
+            if (md == NULL)
+            {
+                MessageBox(hwndEdit,
+                           "Out of memory.",
+                           "Save",
+                           MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            md[0] = '\0';
+        }
+        rtf = md_to_rtf(md);
+        free(md);
+        if (rtf == NULL)
+        {
+            MessageBox(hwndEdit,
+                       "Out of memory.",
+                       "Save",
+                       MB_OK | MB_ICONERROR);
+            return 0;
+        }
+        fp = fopen(filename, "wb");
+        if (fp == NULL)
+        {
+            free(rtf);
+            MessageBox(hwndEdit,
+                       "Unable to create the RTF file.",
+                       "Save",
+                       MB_OK | MB_ICONERROR);
+            return 0;
+        }
+        fwrite(rtf, 1, strlen(rtf), fp);
+        fclose(fp);
+        free(rtf);
+        strncpy(g_filename, filename, MAX_PATH - 1);
+        g_filename[MAX_PATH - 1] = '\0';
+        UpdateTitle();
+        return 1;
+    }
 
     fp = fopen(filename, "wb");
 
@@ -2996,6 +3116,35 @@ LoadMarkdown(HWND hwndEdit, const char *filename)
                    MB_OK | MB_ICONERROR);
         return 0;
     }
+    if (g_showSource)
+    {
+        MemIn m2;
+
+        memset(&m2, 0, sizeof(m2));
+        m2.buf = md;
+        m2.len = (LONG)strlen(md);
+        m2.pos = 0;
+        memset(&es, 0, sizeof(es));
+        es.dwCookie = (DWORD_PTR)&m2;
+        es.pfnCallback = StreamInMemCallback;
+        SendMessage(hwndEdit,
+                    EM_STREAMIN,
+                    (WPARAM)SF_TEXT,
+                    (LPARAM)&es);
+        free(md);
+        if (es.dwError != 0)
+        {
+            MessageBox(hwndEdit,
+                       "Unable to load the file.",
+                       "Open",
+                       MB_OK | MB_ICONERROR);
+            return 0;
+        }
+        strncpy(g_filename, filename, MAX_PATH - 1);
+        g_filename[MAX_PATH - 1] = '\0';
+        UpdateTitle();
+        return 1;
+    }
     rtf = md_to_rtf(md);
     free(md);
     if (rtf == NULL)
@@ -3047,7 +3196,7 @@ SaveMarkdown(HWND hwndEdit, const char *filename)
     es.pfnCallback = StreamOutMemCallback;
     SendMessage(hwndEdit,
                 EM_STREAMOUT,
-                (WPARAM)SF_RTF,
+                (WPARAM)(g_showSource ? SF_TEXT : SF_RTF),
                 (LPARAM)&es);
     if (es.dwError != 0 || m.failed)
     {
@@ -3058,6 +3207,37 @@ SaveMarkdown(HWND hwndEdit, const char *filename)
                    "Save",
                    MB_OK | MB_ICONERROR);
         return 0;
+    }
+    if (g_showSource)
+    {
+        md = m.buf != NULL ? m.buf : NULL;
+        if (md == NULL)
+        {
+            md = (char *)malloc(1);
+            if (md == NULL)
+            {
+                MessageBox(hwndEdit,
+                           "Out of memory.",
+                           "Save",
+                           MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            md[0] = '\0';
+        }
+        ok = write_entire_file(filename, md);
+        free(md);
+        if (!ok)
+        {
+            MessageBox(hwndEdit,
+                       "Unable to create the file.",
+                       "Save",
+                       MB_OK | MB_ICONERROR);
+            return 0;
+        }
+        strncpy(g_filename, filename, MAX_PATH - 1);
+        g_filename[MAX_PATH - 1] = '\0';
+        UpdateTitle();
+        return 1;
     }
     rtf = m.buf != NULL ? m.buf : NULL;
     if (rtf == NULL)
@@ -3203,6 +3383,159 @@ SaveFile(HWND hwnd)
 
 /*
  * ----------------------------------------------------------------------
+ * Markdown source / rich view toggle
+ * ----------------------------------------------------------------------
+ */
+
+static char *
+stream_editor_out(HWND hwndEdit, WPARAM fmt)
+{
+    MemOut m;
+    EDITSTREAM es;
+
+    memset(&m, 0, sizeof(m));
+    memset(&es, 0, sizeof(es));
+    es.dwCookie = (DWORD_PTR)&m;
+    es.pfnCallback = StreamOutMemCallback;
+    SendMessage(hwndEdit, EM_STREAMOUT, fmt, (LPARAM)&es);
+    if (es.dwError != 0 || m.failed)
+    {
+        if (m.buf != NULL)
+            free(m.buf);
+        return NULL;
+    }
+    if (m.buf == NULL)
+    {
+        m.buf = (char *)malloc(1);
+        if (m.buf == NULL)
+            return NULL;
+        m.buf[0] = '\0';
+    }
+    return m.buf;
+}
+
+static int
+stream_editor_in(HWND hwndEdit, WPARAM fmt, const char *text)
+{
+    MemIn m;
+    EDITSTREAM es;
+
+    if (text == NULL)
+        text = "";
+    memset(&m, 0, sizeof(m));
+    m.buf = text;
+    m.len = (LONG)strlen(text);
+    m.pos = 0;
+    memset(&es, 0, sizeof(es));
+    es.dwCookie = (DWORD_PTR)&m;
+    es.pfnCallback = StreamInMemCallback;
+    SendMessage(hwndEdit, EM_STREAMIN, fmt, (LPARAM)&es);
+    return es.dwError == 0;
+}
+
+static void
+UpdateSourceCheck(void)
+{
+    HMENU menu;
+
+    if (g_hwndMain == NULL)
+        return;
+    menu = GetMenu(g_hwndMain);
+    if (menu == NULL)
+        return;
+    CheckMenuItem(menu, IDM_SHOW_SOURCE,
+                  MF_BYCOMMAND |
+                  (g_showSource ? MF_CHECKED : MF_UNCHECKED));
+}
+
+static void
+SetSourceMode(int on)
+{
+    char *out;
+    char *conv;
+
+    if (g_hwndEdit == NULL)
+    {
+        g_showSource = on ? 1 : 0;
+        UpdateSourceCheck();
+        return;
+    }
+    if ((on ? 1 : 0) == g_showSource)
+    {
+        UpdateSourceCheck();
+        return;
+    }
+    if (on)
+    {
+        out = stream_editor_out(g_hwndEdit, SF_RTF);
+        if (out == NULL)
+        {
+            MessageBox(g_hwndMain,
+                       "Unable to read editor content.",
+                       WND_TITLE,
+                       MB_OK | MB_ICONERROR);
+            return;
+        }
+        conv = rtf_to_md(out);
+        free(out);
+        if (conv == NULL)
+        {
+            MessageBox(g_hwndMain,
+                       "Out of memory.",
+                       WND_TITLE,
+                       MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (!stream_editor_in(g_hwndEdit, SF_TEXT, conv))
+        {
+            free(conv);
+            MessageBox(g_hwndMain,
+                       "Unable to show markdown source.",
+                       WND_TITLE,
+                       MB_OK | MB_ICONERROR);
+            return;
+        }
+        free(conv);
+        g_showSource = 1;
+    }
+    else
+    {
+        out = stream_editor_out(g_hwndEdit, SF_TEXT);
+        if (out == NULL)
+        {
+            MessageBox(g_hwndMain,
+                       "Unable to read editor content.",
+                       WND_TITLE,
+                       MB_OK | MB_ICONERROR);
+            return;
+        }
+        conv = md_to_rtf(out);
+        free(out);
+        if (conv == NULL)
+        {
+            MessageBox(g_hwndMain,
+                       "Out of memory.",
+                       WND_TITLE,
+                       MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (!stream_editor_in(g_hwndEdit, SF_RTF, conv))
+        {
+            free(conv);
+            MessageBox(g_hwndMain,
+                       "Unable to show rich text.",
+                       WND_TITLE,
+                       MB_OK | MB_ICONERROR);
+            return;
+        }
+        free(conv);
+        g_showSource = 0;
+    }
+    UpdateSourceCheck();
+}
+
+/*
+ * ----------------------------------------------------------------------
  * Menu
  * ----------------------------------------------------------------------
  */
@@ -3236,6 +3569,9 @@ CreateMainMenu(void)
     AppendMenu(editMenu, MF_STRING, IDM_PASTE,     "&Paste");
     AppendMenu(editMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(editMenu, MF_STRING, IDM_SELECTALL, "Select &All");
+    AppendMenu(editMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(editMenu, MF_STRING | MF_UNCHECKED,
+               IDM_SHOW_SOURCE, "Show &Markdown Source");
 
     AppendMenu(menu, MF_POPUP,
                (UINT_PTR)editMenu, "&Edit");
@@ -3342,6 +3678,10 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case IDM_SELECTALL:
             SendMessage(g_hwndEdit, EM_SETSEL, 0, -1);
             return 0;
+
+        case IDM_SHOW_SOURCE:
+            SetSourceMode(!g_showSource);
+            return 0;
         }
 
         break;
@@ -3380,6 +3720,7 @@ WinMain(HINSTANCE hInstance,
     g_hRichEdit = NULL;
     g_editClass = NULL;
     g_filename[0] = '\0';
+    g_showSource = 0;
 
     /*
      * Prefer Msftedit (RichEdit 4.1+, best table support) and fall back
@@ -3448,6 +3789,7 @@ WinMain(HINSTANCE hInstance,
 
     g_hwndMain = hwnd;
     UpdateTitle();
+    UpdateSourceCheck();
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
