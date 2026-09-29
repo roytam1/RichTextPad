@@ -61,6 +61,8 @@ static const char *g_editClass;
 static char       g_filename[MAX_PATH];
 static int        g_showSource;
 
+static void reset_source_format(void);
+
 /*
  * ----------------------------------------------------------------------
  * Title bar
@@ -758,13 +760,8 @@ md_inline_to_rtf(StrBuf *out, const char *s)
                     return 0;
                 i++;
             }
-            else if (c == '\\' && i + 1 < n &&
-                     (s[i + 1] == '`' || s[i + 1] == '\\'))
-            {
-                if (!rtf_append_text(out, s + i + 1, 1))
-                    return 0;
-                i += 2;
-            }
+            /* Inside code spans backslashes are literal (no escaping).
+               Emit everything raw so "`a\\b`" stays "`a\\b`". */
             else if (uc < 0x80)
             {
                 if (!rtf_append_text(out, s + i, 1))
@@ -1419,6 +1416,7 @@ typedef struct
 {
     int ignore;
     int is_field;
+    int star;
 } RtfGroup;
 
 typedef struct
@@ -1473,13 +1471,22 @@ win1252_to_unicode(unsigned char b)
 static int
 md_needs_escape(char c)
 {
-    /* Minimal set: escaping more (e.g. '.', '#', '-', '>') is correct
-       for literals but noisy and breaks our own list/quote/heading
-       detection which runs on escaped text. Plain "- ", "# ", "> ",
-       "1. " are structural in markdown anyway. */
-    if (c == '\\' || c == '`' || c == '*' || c == '_' ||
-        c == '[' || c == ']' ||
-        c == '(' || c == ')' || c == '|')
+    /* Minimal set, kept in sync with the md_inline_to_rtf unescape
+       list for '(' / ')' / '\\' handling:
+       - '`', '*', '_', '[', ']', '|' are escaped on output and
+         unescaped on input (stable pairs; '[' ']' '|' must be
+         escaped to avoid link/table formation).
+       - '(', ')' and '\\' are emitted RAW on purpose. Our inline
+         parser leaves "\(" / "\)" alone (parens not in its escape
+         list) and passes single "\" through, so escaping them here
+         would add a slash every cycle ("(" -> "\(" -> "\\\(" ...).
+         Raw parens are harmless mid-text ("[", "]" stay escaped, so
+         no accidental links); raw backslashes normalize once
+         ("\\" -> "\") then stay stable.
+       - '.', '#', '-', '>', '+', '!' are also raw for the same
+         reason (keeps list/quote/heading detection working). */
+    if (c == '`' || c == '*' || c == '_' ||
+        c == '[' || c == ']' || c == '|')
         return 1;
     return 0;
 }
@@ -1499,6 +1506,33 @@ md_append_codepoint(StrBuf *out, unsigned long cp)
         c = (char)cp;
         if (md_needs_escape(c))
         {
+            if (!sb_append_char(out, '\\'))
+                return 0;
+        }
+        return sb_append_char(out, c);
+    }
+    nb = utf8_encode(cp, tmp);
+    tmp[nb] = '\0';
+    return sb_append_n(out, tmp, (size_t)nb);
+}
+
+static int
+md_append_raw(StrBuf *out, unsigned long cp)
+{
+    char tmp[5];
+    int nb;
+
+    if (cp == 0)
+        return 1;
+    if (cp < 0x80)
+    {
+        char c;
+
+        c = (char)cp;
+        if (c == '`')
+        {
+            /* Avoid closing the code span; input side treats
+               backslashes in code as literal, so "\`" survives. */
             if (!sb_append_char(out, '\\'))
                 return 0;
         }
@@ -1656,8 +1690,18 @@ rtf_append_plain(RtfParse *st, const char *s, size_t n)
         {
             st->para_has_nonmono = 1;
         }
-        if (!md_append_codepoint(t, cp))
-            return 0;
+        /* Inside `code` backslashes are literal on both sides;
+           escaping them here would double them every cycle. */
+        if (st->cur_mono && t != &st->fld_result)
+        {
+            if (!md_append_raw(t, cp))
+                return 0;
+        }
+        else
+        {
+            if (!md_append_codepoint(t, cp))
+                return 0;
+        }
         i += (size_t)nb;
     }
     return 1;
@@ -1723,9 +1767,17 @@ rtf_flush_para(RtfParse *st)
     st->cur_bold = 0;
     st->cur_italic = 0;
     st->cur_mono = 0;
+    /* Empty RTF paras collapse: block flushes already terminate with
+       blank lines, so emitting another "\n" here would grow blanks
+       every cycle. Exception: list/code/quote/table blocks end with a
+       single "\n", so one empty para after them completes the blank
+       line (further empties collapse via prev==7). */
     if (st->para.data == NULL || st->para.len == 0)
     {
-        sb_append_char(&st->md, '\n');
+        st->para_has_text = 0;
+        if (st->prev_block == 2 || st->prev_block == 3 ||
+            st->prev_block == 5 || st->prev_block == 6)
+            sb_append_char(&st->md, '\n');
         st->prev_block = 7;
         return 1;
     }
@@ -1743,7 +1795,9 @@ rtf_flush_para(RtfParse *st)
         if (st->para.data != NULL)
             st->para.data[0] = '\0';
         st->para_has_text = 0;
-        sb_append_char(&st->md, '\n');
+        if (st->prev_block == 2 || st->prev_block == 3 ||
+            st->prev_block == 5 || st->prev_block == 6)
+            sb_append_char(&st->md, '\n');
         st->prev_block = 7;
         return 1;
     }
@@ -2080,6 +2134,7 @@ rtf_to_md(const char *rtf)
             {
                 st.stack[st.depth].ignore = ign;
                 st.stack[st.depth].is_field = 0;
+                st.stack[st.depth].star = 0;
                 st.depth++;
             }
             i++;
@@ -2248,6 +2303,8 @@ rtf_to_md(const char *rtf)
                     }
                 }
                 /* \*, \-, \:, etc.: destination / formatting, ignore. */
+                if (nc == '*' && st.depth > 0)
+                    st.stack[st.depth - 1].star = 1;
                 i += 2;
                 continue;
             }
@@ -2292,6 +2349,23 @@ rtf_to_md(const char *rtf)
                 if (j < len && rtf[j] == ' ')
                     j++;
                 i = j;
+
+                /* {\*destination ...}: ignore unless field-related. */
+                if (st.depth > 0 && st.stack[st.depth - 1].star)
+                {
+                    st.stack[st.depth - 1].star = 0;
+                    if (!(strcmp(word, "field") == 0 ||
+                          strcmp(word, "fldinst") == 0 ||
+                          strcmp(word, "fldrslt") == 0 ||
+                          strcmp(word, "formfield") == 0 ||
+                          strcmp(word, "datafield") == 0 ||
+                          strcmp(word, "ffname") == 0 ||
+                          strcmp(word, "ffdeftext") == 0))
+                    {
+                        st.stack[st.depth - 1].ignore = 1;
+                        continue;
+                    }
+                }
 
                 if (strcmp(word, "par") == 0 ||
                     strcmp(word, "line") == 0)
@@ -2514,7 +2588,15 @@ rtf_to_md(const char *rtf)
                          strcmp(word, "stylesheet") == 0 ||
                          strcmp(word, "info") == 0 ||
                          strcmp(word, "title") == 0 ||
-                         strcmp(word, "author") == 0)
+                         strcmp(word, "author") == 0 ||
+                         strcmp(word, "subject") == 0 ||
+                         strcmp(word, "keywords") == 0 ||
+                         strcmp(word, "comment") == 0 ||
+                         strcmp(word, "generator") == 0 ||
+                         strcmp(word, "themedata") == 0 ||
+                         strcmp(word, "colorschememapping") == 0 ||
+                         strcmp(word, "datastore") == 0 ||
+                         strcmp(word, "mmathPr") == 0)
                 {
                     if (st.depth > 0)
                         st.stack[st.depth - 1].ignore = 1;
@@ -2610,27 +2692,12 @@ rtf_to_md(const char *rtf)
                             cc = (unsigned char)rtf[k];
                             if (cc < 0x80)
                             {
-                                if (cc == ' ' || cc == '\t')
-                                {
-                                    sb_append_char(&st.fld_result, ' ');
-                                }
-                                else
-                                {
-                                    /* light escape for link text */
-                                    if (md_needs_escape((char)cc) &&
-                                        cc != ' ' && cc != '\t')
-                                    {
-                                        /* link text: keep plain,
-                                           escape [ ] ( ) */
-                                        if (cc == '[' || cc == ']' ||
-                                            cc == '(' || cc == ')' ||
-                                            cc == '\\')
-                                            sb_append_char(
-                                                &st.fld_result, '\\');
-                                    }
-                                    sb_append_char(&st.fld_result,
-                                                   (char)cc);
-                                }
+                                /* Link text is raw on the md->rtf side
+                                   (rtf_append_text, no unescaping), so keep
+                                   it raw here too; escaping backslashes
+                                   would double them every cycle. */
+                                sb_append_char(&st.fld_result,
+                                               (char)cc);
                                 k++;
                             }
                             else
@@ -2943,6 +3010,7 @@ LoadRTF(HWND hwndEdit, const char *filename)
         strncpy(g_filename, filename, MAX_PATH - 1);
         g_filename[MAX_PATH - 1] = '\0';
         UpdateTitle();
+        reset_source_format();
         return 1;
     }
 
@@ -3143,6 +3211,7 @@ LoadMarkdown(HWND hwndEdit, const char *filename)
         strncpy(g_filename, filename, MAX_PATH - 1);
         g_filename[MAX_PATH - 1] = '\0';
         UpdateTitle();
+        reset_source_format();
         return 1;
     }
     rtf = md_to_rtf(md);
@@ -3434,6 +3503,37 @@ stream_editor_in(HWND hwndEdit, WPARAM fmt, const char *text)
 }
 
 static void
+reset_source_format(void)
+{
+    CHARFORMAT cf;
+    PARAFORMAT pf;
+
+    if (g_hwndEdit == NULL)
+        return;
+    SendMessage(g_hwndEdit, EM_SETSEL, 0, -1);
+    memset(&cf, 0, sizeof(cf));
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT |
+                CFM_SIZE | CFM_FACE | CFM_COLOR | CFM_CHARSET;
+    cf.dwEffects = 0;
+    cf.yHeight = 200;
+    cf.bCharSet = DEFAULT_CHARSET;
+    strcpy(cf.szFaceName, "Courier New");
+    SendMessage(g_hwndEdit, EM_SETCHARFORMAT,
+                (WPARAM)SCF_ALL, (LPARAM)&cf);
+    memset(&pf, 0, sizeof(pf));
+    pf.cbSize = sizeof(pf);
+    pf.dwMask = PFM_ALIGNMENT | PFM_STARTINDENT | PFM_RIGHTINDENT |
+                PFM_OFFSET;
+    pf.wAlignment = PFA_LEFT;
+    pf.dxStartIndent = 0;
+    pf.dxRightIndent = 0;
+    pf.dxOffset = 0;
+    SendMessage(g_hwndEdit, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
+    SendMessage(g_hwndEdit, EM_SETSEL, 0, 0);
+}
+
+static void
 UpdateSourceCheck(void)
 {
     HMENU menu;
@@ -3496,6 +3596,7 @@ SetSourceMode(int on)
             return;
         }
         free(conv);
+        reset_source_format();
         g_showSource = 1;
     }
     else
@@ -3733,7 +3834,9 @@ WinMain(HINSTANCE hInstance,
 
     if (g_hRichEdit != NULL)
     {
-        g_editClass = MSFTEDIT_CLASS;
+        /* NOTE: use ANSI literal, not MSFTEDIT_CLASS macro which is
+           wide (L"RICHEDIT50W") in newer SDKs. */
+        g_editClass = "RICHEDIT50W";
     }
     else
     {
