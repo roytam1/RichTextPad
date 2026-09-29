@@ -4755,6 +4755,10 @@ WinMain(HINSTANCE hInstance,
     {
         g_hRichEdit = LoadLibrary("RICHED20.DLL");
         g_editClass = RICHEDIT_CLASSA;
+        if (g_hRichEdit == NULL) {
+            g_hRichEdit = LoadLibrary("RICHED32.DLL");
+            g_editClass = "RICHEDIT";
+        }
     }
 
     if (g_hRichEdit == NULL)
