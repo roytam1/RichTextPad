@@ -1487,6 +1487,8 @@ typedef struct
     int star;
 } RtfGroup;
 
+#define RTF_MAX_FONTS 64
+
 typedef struct
 {
     StrBuf md;
@@ -1517,6 +1519,13 @@ typedef struct
     StrBuf fld_result;
     RtfGroup stack[RTF_MAX_DEPTH];
     int depth;
+    /* fonttbl -> monospace mapping (controls renumber fonts) */
+    int fonttbl_depth;
+    int font_entry;
+    char font_name[64];
+    int font_namelen;
+    int fonts_mono[RTF_MAX_FONTS];
+    int fonts_tbl;
 } RtfParse;
 
 static unsigned long
@@ -1690,6 +1699,61 @@ rtf_toggle_italic(RtfParse *st, int on)
             return 0;
     }
     return 1;
+}
+
+static int
+is_mono_font_name(const char *name)
+{
+    /* case-insensitive substring match */
+    const char *subs[] = {
+        "courier", "consolas", "lucida console",
+        "fixedsys", "terminal", NULL
+    };
+    int k;
+    const char *p;
+
+    if (name == NULL)
+        return 0;
+    k = 0;
+    while (subs[k] != NULL)
+    {
+        p = name;
+        while (*p != '\0')
+        {
+            const char *a;
+            const char *b;
+            a = p;
+            b = subs[k];
+            while (*b != '\0')
+            {
+                char ca;
+                char cb;
+                ca = *a;
+                cb = *b;
+                if (ca >= 'A' && ca <= 'Z')
+                    ca = (char)(ca + 32);
+                if (ca != cb)
+                    break;
+                a++;
+                b++;
+            }
+            if (*b == '\0')
+                return 1;
+            p++;
+        }
+        k++;
+    }
+    return 0;
+}
+
+static int
+is_mono_font(RtfParse *st, int idx)
+{
+    if (idx < 0 || idx >= RTF_MAX_FONTS)
+        return 0;
+    if (!st->fonts_tbl)
+        return 0;
+    return st->fonts_mono[idx];
 }
 
 static int
@@ -2224,6 +2288,9 @@ rtf_to_md(const char *rtf)
     st.cell_idx = 0;
     st.field_depth = -1;
     st.depth = 0;
+    st.fonttbl_depth = -1;
+    st.font_entry = -1;
+    st.font_namelen = 0;
 
     if (rtf == NULL)
         rtf = "";
@@ -2254,6 +2321,12 @@ rtf_to_md(const char *rtf)
         {
             if (st.depth > 0)
                 st.depth--;
+            if (st.fonttbl_depth >= 0 && st.depth < st.fonttbl_depth)
+            {
+                st.fonttbl_depth = -1;
+                st.font_entry = -1;
+                st.font_namelen = 0;
+            }
             if (st.in_fldinst && st.depth < st.fldinst_depth)
                 st.in_fldinst = 0;
             if (st.in_fldrslt && st.depth < st.fldrslt_depth)
@@ -2567,7 +2640,20 @@ rtf_to_md(const char *rtf)
                 }
                 else if (strcmp(word, "f") == 0)
                 {
-                    if (has_param && param == 1)
+                    if (st.fonttbl_depth >= 0 &&
+                        st.depth > st.fonttbl_depth)
+                    {
+                        /* fonttbl entry: name text follows */
+                        if (has_param && param >= 0 &&
+                            param < RTF_MAX_FONTS)
+                            st.font_entry = (int)param;
+                        else
+                            st.font_entry = -1;
+                        st.font_namelen = 0;
+                    }
+                    else if (has_param &&
+                             (param == 1 ||
+                              is_mono_font(&st, (int)param)))
                         rtf_toggle_mono(&st, 1);
                     else
                         rtf_toggle_mono(&st, 0);
@@ -2694,8 +2780,16 @@ rtf_to_md(const char *rtf)
                     st.fldrslt_depth = st.depth;
                     st.in_fldinst = 0;
                 }
-                else if (strcmp(word, "fonttbl") == 0 ||
-                         strcmp(word, "colortbl") == 0 ||
+                else if (strcmp(word, "fonttbl") == 0)
+                {
+                    if (st.depth > 0)
+                        st.stack[st.depth - 1].ignore = 1;
+                    st.fonttbl_depth = st.depth;
+                    st.font_entry = -1;
+                    st.font_namelen = 0;
+                    st.fonts_tbl = 1;
+                }
+                else if (strcmp(word, "colortbl") == 0 ||
                          strcmp(word, "stylesheet") == 0 ||
                          strcmp(word, "info") == 0 ||
                          strcmp(word, "title") == 0 ||
@@ -2748,7 +2842,35 @@ rtf_to_md(const char *rtf)
                 j++;
             if (j > i)
             {
-                if (!(st.depth > 0 &&
+                if (st.fonttbl_depth >= 0 &&
+                    st.depth > st.fonttbl_depth)
+                {
+                    /* fonttbl entry name text; ';' ends the entry */
+                    size_t k;
+
+                    k = i;
+                    while (k < j)
+                    {
+                        if (rtf[k] == ';')
+                        {
+                            st.font_name[st.font_namelen] = '\0';
+                            if (st.font_entry >= 0 &&
+                                st.font_entry < RTF_MAX_FONTS)
+                                st.fonts_mono[st.font_entry] =
+                                    is_mono_font_name(st.font_name);
+                            st.font_entry = -1;
+                            st.font_namelen = 0;
+                        }
+                        else if (st.font_namelen <
+                                 (int)sizeof(st.font_name) - 1)
+                        {
+                            st.font_name[st.font_namelen] = rtf[k];
+                            st.font_namelen++;
+                        }
+                        k++;
+                    }
+                }
+                else if (!(st.depth > 0 &&
                       st.stack[st.depth - 1].ignore))
                 {
                     if (st.in_field && st.in_fldinst)
