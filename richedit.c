@@ -2322,10 +2322,7 @@ static int
 rtf_append_ansi_bytes(RtfParse *st, const unsigned char *bytes, int n)
 {
     WCHAR *w;
-    char *u;
     int wn;
-    int un;
-    int ok;
 
     if (n <= 0)
         return 1;
@@ -2358,6 +2355,36 @@ rtf_append_ansi_bytes(RtfParse *st, const unsigned char *bytes, int n)
             k++;
         }
         return 1;
+    }
+    if (st->ansi_cp == 65001)
+    {
+        /* UTF-8 bytes: no OS codepage needed (retro-safe). */
+        if (st->in_field && st->in_fldrslt)
+        {
+            int k;
+            unsigned long cp;
+            char ub[5];
+            int nb;
+            int used;
+
+            k = 0;
+            while (k < n)
+            {
+                if (utf8_decode(bytes + k, (size_t)(n - k), &cp, &nb))
+                    used = nb;
+                else
+                {
+                    cp = '?';
+                    used = 1;
+                }
+                nb = utf8_encode(cp, ub);
+                if (!sb_append_n(&st->fld_result, ub, (size_t)nb))
+                    return 0;
+                k += used;
+            }
+            return 1;
+        }
+        return rtf_append_plain(st, (const char *)bytes, (size_t)n);
     }
     wn = MultiByteToWideChar((UINT)st->ansi_cp, 0,
                              (LPCSTR)bytes, n, NULL, 0);
@@ -2397,33 +2424,41 @@ rtf_append_ansi_bytes(RtfParse *st, const unsigned char *bytes, int n)
         free(w);
         return 1;
     }
-    w[wn] = 0;
-    un = WideCharToMultiByte(CP_UTF8, 0, w, wn, NULL, 0, NULL, NULL);
-    if (un <= 0)
+    /* Manual WCHAR -> UTF-8 (retro-safe; DBCS maps to BMP only). */
     {
-        free(w);
-        return 1;
-    }
-    u = (char *)malloc((size_t)un + 1);
-    if (u == NULL)
-    {
-        free(w);
-        return 0;
-    }
-    if (WideCharToMultiByte(CP_UTF8, 0, w, wn, u, un, NULL, NULL) <= 0)
-    {
-        free(w);
-        free(u);
-        return 1;
+        int k;
+        unsigned long cp;
+        char ub[5];
+        int nb;
+
+        k = 0;
+        while (k < wn)
+        {
+            cp = (unsigned long)w[k];
+            if (cp >= 0xD800 && cp <= 0xDFFF)
+                cp = '?';
+            nb = utf8_encode(cp, ub);
+            if (st->in_field && st->in_fldrslt)
+            {
+                if (!sb_append_n(&st->fld_result, ub, (size_t)nb))
+                {
+                    free(w);
+                    return 0;
+                }
+            }
+            else
+            {
+                if (!rtf_append_plain(st, ub, (size_t)nb))
+                {
+                    free(w);
+                    return 0;
+                }
+            }
+            k++;
+        }
     }
     free(w);
-    u[un] = '\0';
-    if (st->in_field && st->in_fldrslt)
-        ok = sb_append_n(&st->fld_result, u, (size_t)un);
-    else
-        ok = rtf_append_plain(st, u, (size_t)un);
-    free(u);
-    return ok;
+    return 1;
 }
 
 static void
@@ -4034,62 +4069,216 @@ stream_editor_in(HWND hwndEdit, WPARAM fmt, const char *text)
     return es.dwError == 0;
 }
 
-#ifdef UNICODE
 /*
  * ----------------------------------------------------------------------
- * UTF-8 <-> UTF-16 boundary (Unicode build only)
+ * UTF-8 <-> UTF-16 boundary (both flavors, manual for retro Windows)
  * ----------------------------------------------------------------------
  *
- * Converters and files stay byte-based (UTF-8 + RTF); only text
- * exchanged with the Unicode control needs conversion. Both helpers
- * return malloc'd buffers; caller frees (NULL on failure).
+ * Converters and files stay byte-based (UTF-8 + RTF); text exchanged
+ * with the control needs conversion. Manual codecs avoid CP_UTF8,
+ * which is missing on some retro Windows. Both helpers return
+ * malloc'd buffers; caller frees (NULL on failure).
  */
 
 static WCHAR *
 utf8_to_wide(const char *s)
 {
-    int n;
+    size_t len;
+    size_t i;
+    size_t need;
     WCHAR *w;
+    size_t k;
 
+    /* Manual UTF-8 -> UTF-16 (no CP_UTF8 dependency for retro Windows).
+       Fails (NULL) on invalid sequences, like the OS API. */
     if (s == NULL)
         s = "";
-    n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
-    if (n <= 0)
-        return NULL;
-    w = (WCHAR *)malloc((size_t)n * sizeof(WCHAR));
+    len = strlen(s);
+    need = 1;
+    i = 0;
+    while (i < len)
+    {
+        unsigned long cp;
+        int nb;
+
+        if (!utf8_decode((const unsigned char *)s + i, len - i, &cp, &nb))
+            return NULL;
+        if (cp >= 0xD800 && cp <= 0xDFFF)
+            return NULL;
+        if (cp > 0x10FFFF)
+            return NULL;
+        if (cp < 0x10000)
+            need += 1;
+        else
+            need += 2;
+        i += (size_t)nb;
+    }
+    w = (WCHAR *)malloc(need * sizeof(WCHAR));
     if (w == NULL)
         return NULL;
-    if (MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n) <= 0)
+    i = 0;
+    k = 0;
+    while (i < len)
     {
-        free(w);
-        return NULL;
+        unsigned long cp;
+        int nb;
+
+        utf8_decode((const unsigned char *)s + i, len - i, &cp, &nb);
+        if (cp < 0x10000)
+        {
+            w[k++] = (WCHAR)cp;
+        }
+        else
+        {
+            cp -= 0x10000;
+            w[k++] = (WCHAR)(0xD800 + (cp >> 10));
+            w[k++] = (WCHAR)(0xDC00 + (cp & 0x3FF));
+        }
+        i += (size_t)nb;
     }
+    w[k] = 0;
     return w;
 }
 
 static char *
 wide_to_utf8(const WCHAR *w, int wlen)
 {
-    int n;
+    size_t len;
+    size_t i;
+    size_t need;
     char *s;
+    size_t k;
+    char tmp[5];
 
+    /* Manual UTF-16 -> UTF-8 (no CP_UTF8 dependency for retro Windows).
+       Fails (NULL) on unpaired surrogates, like the OS API. */
     if (w == NULL)
         return NULL;
-    n = WideCharToMultiByte(CP_UTF8, 0, w, wlen, NULL, 0, NULL, NULL);
-    if (n <= 0)
+    if (wlen < 0)
+        len = wcslen(w);
+    else if (wlen == 0)
         return NULL;
-    s = (char *)malloc((size_t)n + 1);
+    else
+        len = (size_t)wlen;
+    need = 0;
+    i = 0;
+    while (i < len)
+    {
+        unsigned long cp;
+        WCHAR hi;
+        WCHAR lo;
+
+        hi = w[i];
+        if (hi >= 0xD800 && hi <= 0xDBFF)
+        {
+            if (i + 1 >= len)
+                return NULL;
+            lo = w[i + 1];
+            if (lo < 0xDC00 || lo > 0xDFFF)
+                return NULL;
+            need += 4;
+            i += 2;
+        }
+        else if (hi >= 0xDC00 && hi <= 0xDFFF)
+        {
+            return NULL;
+        }
+        else
+        {
+            cp = (unsigned long)hi;
+            if (cp < 0x80)
+                need += 1;
+            else if (cp < 0x800)
+                need += 2;
+            else
+                need += 3;
+            i += 1;
+        }
+    }
+    s = (char *)malloc(need + 1);
     if (s == NULL)
         return NULL;
-    if (WideCharToMultiByte(CP_UTF8, 0, w, wlen, s, n, NULL, NULL) <= 0)
+    i = 0;
+    k = 0;
+    while (i < len)
     {
-        free(s);
-        return NULL;
+        unsigned long cp;
+        WCHAR hi;
+        WCHAR lo;
+        int nb;
+
+        hi = w[i];
+        if (hi >= 0xD800 && hi <= 0xDBFF)
+        {
+            lo = w[i + 1];
+            cp = 0x10000UL +
+                 (((unsigned long)(hi - 0xD800) << 10) |
+                  (unsigned long)(lo - 0xDC00));
+            nb = utf8_encode(cp, tmp);
+            memcpy(s + k, tmp, (size_t)nb);
+            k += (size_t)nb;
+            i += 2;
+        }
+        else
+        {
+            cp = (unsigned long)hi;
+            nb = utf8_encode(cp, tmp);
+            memcpy(s + k, tmp, (size_t)nb);
+            k += (size_t)nb;
+            i += 1;
+        }
     }
-    s[n] = '\0';
+    s[k] = '\0';
     return s;
 }
-#endif
+
+/* UTF-8 -> UTF-16 into a fixed buffer (manual, retro-safe).
+   Returns WCHAR count including NUL, like MultiByteToWideChar,
+   or 0 on invalid input or too-small buffer. */
+static int
+utf8_to_wide_buf(const char *s, WCHAR *out, int outcap)
+{
+    size_t len;
+    size_t i;
+    int k;
+
+    if (s == NULL)
+        s = "";
+    if (out == NULL || outcap <= 1)
+        return 0;
+    len = strlen(s);
+    i = 0;
+    k = 0;
+    while (i < len)
+    {
+        unsigned long cp;
+        int nb;
+
+        if (!utf8_decode((const unsigned char *)s + i, len - i, &cp, &nb))
+            return 0;
+        if (cp >= 0xD800 && cp <= 0xDFFF)
+            return 0;
+        if (cp > 0x10FFFF)
+            return 0;
+        if (cp < 0x10000)
+        {
+            if (k + 1 >= outcap)
+                return 0;
+            out[k++] = (WCHAR)cp;
+        }
+        else
+        {
+            if (k + 2 >= outcap)
+                return 0;
+            cp -= 0x10000;
+            out[k++] = (WCHAR)(0xD800 + (cp >> 10));
+            out[k++] = (WCHAR)(0xDC00 + (cp & 0x3FF));
+        }
+        i += (size_t)nb;
+    }
+    out[k++] = 0;
+    return k;
+}
 
 #ifndef UNICODE
 static char *
@@ -4098,7 +4287,6 @@ ansi_to_utf8(const char *s)
     WCHAR *w;
     char *u;
     int wn;
-    int un;
 
     if (s == NULL)
         s = "";
@@ -4113,24 +4301,7 @@ ansi_to_utf8(const char *s)
         free(w);
         return NULL;
     }
-    un = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
-    if (un <= 0)
-    {
-        free(w);
-        return NULL;
-    }
-    u = (char *)malloc((size_t)un);
-    if (u == NULL)
-    {
-        free(w);
-        return NULL;
-    }
-    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, un, NULL, NULL) <= 0)
-    {
-        free(w);
-        free(u);
-        return NULL;
-    }
+    u = wide_to_utf8(w, -1);
     free(w);
     return u;
 }
@@ -4140,22 +4311,13 @@ utf8_to_ansi(const char *s)
 {
     WCHAR *w;
     char *a;
-    int wn;
     int an;
 
     if (s == NULL)
         s = "";
-    wn = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
-    if (wn <= 0)
-        return NULL;
-    w = (WCHAR *)malloc((size_t)wn * sizeof(WCHAR));
+    w = utf8_to_wide(s);
     if (w == NULL)
         return NULL;
-    if (MultiByteToWideChar(CP_UTF8, 0, s, -1, w, wn) <= 0)
-    {
-        free(w);
-        return NULL;
-    }
     an = WideCharToMultiByte(CP_ACP, 0, w, -1, NULL, 0, NULL, NULL);
     if (an <= 0)
     {
@@ -4439,8 +4601,7 @@ SetSourceMode(int on)
  */
 
 /* Markdown files and converter buffers are UTF-8 in both flavors;
-   link display text is converted from UTF-8 for FindText. */
-#define MD_CODEPAGE CP_UTF8
+   link display text uses utf8_to_wide_buf (manual, retro-safe). */
 
 #define MD_MAX_LINKS 256
 #define MD_LINK_TEXT_MAX 256
@@ -4629,8 +4790,7 @@ apply_link_effects(const char *md)
         found = 0;
         /* Phase 1: native field link (Msftedit marks results CFE_LINK).
            Plain lookalikes are skipped, never linked: no phantoms. */
-        wlen = MultiByteToWideChar(MD_CODEPAGE, 0, links[i].text, -1,
-                                   wtext, MD_LINK_TEXT_MAX);
+        wlen = utf8_to_wide_buf(links[i].text, wtext, MD_LINK_TEXT_MAX);
         if (wlen > 1)
         {
             search = pos;
@@ -4679,8 +4839,7 @@ apply_link_effects(const char *md)
                 needle[dl + 1] = '<';
                 memcpy(needle + dl + 2, links[i].url, un);
                 needle[dl + 2 + un] = '\0';
-                if (MultiByteToWideChar(MD_CODEPAGE, 0, needle, -1,
-                                        wneedle, 1024) > 1)
+                if (utf8_to_wide_buf(needle, wneedle, 1024) > 1)
                 {
                     ftw.chrg.cpMin = pos;
                     ftw.chrg.cpMax = -1;
