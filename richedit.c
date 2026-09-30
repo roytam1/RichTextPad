@@ -4088,27 +4088,145 @@ wide_to_utf8(const WCHAR *w, int wlen)
 }
 #endif
 
+#ifndef UNICODE
+static char *
+ansi_to_utf8(const char *s)
+{
+    WCHAR *w;
+    char *u;
+    int wn;
+    int un;
+
+    if (s == NULL)
+        s = "";
+    wn = MultiByteToWideChar(CP_ACP, 0, s, -1, NULL, 0);
+    if (wn <= 0)
+        return NULL;
+    w = (WCHAR *)malloc((size_t)wn * sizeof(WCHAR));
+    if (w == NULL)
+        return NULL;
+    if (MultiByteToWideChar(CP_ACP, 0, s, -1, w, wn) <= 0)
+    {
+        free(w);
+        return NULL;
+    }
+    un = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (un <= 0)
+    {
+        free(w);
+        return NULL;
+    }
+    u = (char *)malloc((size_t)un);
+    if (u == NULL)
+    {
+        free(w);
+        return NULL;
+    }
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, un, NULL, NULL) <= 0)
+    {
+        free(w);
+        free(u);
+        return NULL;
+    }
+    free(w);
+    return u;
+}
+
+static char *
+utf8_to_ansi(const char *s)
+{
+    WCHAR *w;
+    char *a;
+    int wn;
+    int an;
+
+    if (s == NULL)
+        s = "";
+    wn = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (wn <= 0)
+        return NULL;
+    w = (WCHAR *)malloc((size_t)wn * sizeof(WCHAR));
+    if (w == NULL)
+        return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, s, -1, w, wn) <= 0)
+    {
+        free(w);
+        return NULL;
+    }
+    an = WideCharToMultiByte(CP_ACP, 0, w, -1, NULL, 0, NULL, NULL);
+    if (an <= 0)
+    {
+        free(w);
+        return NULL;
+    }
+    a = (char *)malloc((size_t)an);
+    if (a == NULL)
+    {
+        free(w);
+        return NULL;
+    }
+    if (WideCharToMultiByte(CP_ACP, 0, w, -1, a, an, NULL, NULL) <= 0)
+    {
+        free(w);
+        free(a);
+        return NULL;
+    }
+    free(w);
+    return a;
+}
+#endif
+
 /*
  * Plain-text exchange with the control, always UTF-8 on the caller
- * side (converts to/from UTF-16 in the Unicode build).
+ * side (ANSI build prefers UTF-8 transfer on 3.0+, falls back to
+ * ANSI with conversion; Unicode build uses UTF-16).
  */
 static char *
 stream_editor_text_out(HWND hwndEdit)
 {
-    char *raw;
 #ifdef UNICODE
+    char *raw;
     char *utf8;
-#endif
 
     raw = stream_editor_out(hwndEdit, SF_TEXT_EX);
     if (raw == NULL)
         return NULL;
-#ifdef UNICODE
     utf8 = wide_to_utf8((const WCHAR *)raw, -1);
     free(raw);
     return utf8;
 #else
-    return raw;
+    MemOut m;
+    EDITSTREAM es;
+    WPARAM tryfmt;
+    char *raw;
+    char *utf8;
+
+    memset(&m, 0, sizeof(m));
+    memset(&es, 0, sizeof(es));
+    es.dwCookie = (DWORD_PTR)&m;
+    es.pfnCallback = StreamOutMemCallback;
+    tryfmt = (WPARAM)(((DWORD)CP_UTF8 << 16) |
+                      (SF_TEXT | SF_USECODEPAGE));
+    SendMessage(hwndEdit, EM_STREAMOUT, tryfmt, (LPARAM)&es);
+    if (es.dwError == 0 && !m.failed)
+    {
+        if (m.buf == NULL)
+        {
+            m.buf = (char *)malloc(1);
+            if (m.buf == NULL)
+                return NULL;
+            m.buf[0] = '\0';
+        }
+        return m.buf;
+    }
+    if (m.buf != NULL)
+        free(m.buf);
+    raw = stream_editor_out(hwndEdit, SF_TEXT_EX);
+    if (raw == NULL)
+        return NULL;
+    utf8 = ansi_to_utf8(raw);
+    free(raw);
+    return utf8;
 #endif
 }
 
@@ -4139,7 +4257,32 @@ stream_editor_text_in(HWND hwndEdit, const char *text)
     free(w);
     return ok;
 #else
-    return stream_editor_in(hwndEdit, SF_TEXT_EX, text);
+    MemIn m;
+    EDITSTREAM es;
+    WPARAM tryfmt;
+    char *ansi;
+    int ok;
+
+    if (text == NULL)
+        text = "";
+    memset(&m, 0, sizeof(m));
+    m.buf = text;
+    m.len = (LONG)strlen(text);
+    m.pos = 0;
+    memset(&es, 0, sizeof(es));
+    es.dwCookie = (DWORD_PTR)&m;
+    es.pfnCallback = StreamInMemCallback;
+    tryfmt = (WPARAM)(((DWORD)CP_UTF8 << 16) |
+                      (SF_TEXT | SF_USECODEPAGE));
+    SendMessage(hwndEdit, EM_STREAMIN, tryfmt, (LPARAM)&es);
+    if (es.dwError == 0)
+        return 1;
+    ansi = utf8_to_ansi(text);
+    if (ansi == NULL)
+        return 0;
+    ok = stream_editor_in(hwndEdit, SF_TEXT_EX, ansi);
+    free(ansi);
+    return ok;
 #endif
 }
 
@@ -4292,13 +4435,9 @@ SetSourceMode(int on)
  * controls, nearby "<url>"/bare URL text on old ones).
  */
 
-/* Markdown files are UTF-8; the Unicode build converts them with
-   CP_UTF8. The ANSI build keeps CP_ACP (historical behavior). */
-#ifdef UNICODE
+/* Markdown files and converter buffers are UTF-8 in both flavors;
+   link display text is converted from UTF-8 for FindText. */
 #define MD_CODEPAGE CP_UTF8
-#else
-#define MD_CODEPAGE CP_ACP
-#endif
 
 #define MD_MAX_LINKS 256
 #define MD_LINK_TEXT_MAX 256
