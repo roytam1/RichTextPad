@@ -1,0 +1,1 @@
+cl /Ox /Ferichedtw.exe /D_UNICODE /DUNICODE richedit.c user32.lib comdlg32.lib shell32.lib
