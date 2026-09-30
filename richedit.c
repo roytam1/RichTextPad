@@ -76,6 +76,19 @@
 #ifndef EN_LINK
 #define EN_LINK 0x070b
 #endif
+#ifndef SF_UNICODE
+#define SF_UNICODE 0x0010
+#endif
+
+/* Plain-text streaming must carry SF_UNICODE on Unicode controls:
+   without it the control transfers ANSI (UTF-16 bytes streamed in
+   land as one character per byte, NULs showing as spaces; streamed
+   out they come back ANSI, not UTF-16). */
+#ifdef UNICODE
+#define SF_TEXT_EX (SF_TEXT | SF_UNICODE)
+#else
+#define SF_TEXT_EX SF_TEXT
+#endif
 
 #if defined(_MSC_VER) && _MSC_VER < 1200
 typedef struct _enlink {
@@ -3771,7 +3784,7 @@ stream_editor_text_out(HWND hwndEdit)
     char *utf8;
 #endif
 
-    raw = stream_editor_out(hwndEdit, SF_TEXT);
+    raw = stream_editor_out(hwndEdit, SF_TEXT_EX);
     if (raw == NULL)
         return NULL;
 #ifdef UNICODE
@@ -3804,13 +3817,13 @@ stream_editor_text_in(HWND hwndEdit, const char *text)
         memset(&es, 0, sizeof(es));
         es.dwCookie = (DWORD_PTR)&m;
         es.pfnCallback = StreamInMemCallback;
-        SendMessage(hwndEdit, EM_STREAMIN, (WPARAM)SF_TEXT, (LPARAM)&es);
+        SendMessage(hwndEdit, EM_STREAMIN, (WPARAM)SF_TEXT_EX, (LPARAM)&es);
         ok = (es.dwError == 0);
     }
     free(w);
     return ok;
 #else
-    return stream_editor_in(hwndEdit, SF_TEXT, text);
+    return stream_editor_in(hwndEdit, SF_TEXT_EX, text);
 #endif
 }
 
@@ -4453,7 +4466,7 @@ get_selection_text(void)
     es.pfnCallback = StreamOutMemCallback;
     SendMessage(g_hwndEdit,
                 EM_STREAMOUT,
-                (WPARAM)(SFF_SELECTION | SF_TEXT),
+                (WPARAM)(SFF_SELECTION | SF_TEXT_EX),
                 (LPARAM)&es);
     if (es.dwError != 0 || m.failed || m.buf == NULL)
     {
