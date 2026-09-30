@@ -79,6 +79,12 @@
 #ifndef SF_UNICODE
 #define SF_UNICODE 0x0010
 #endif
+#ifndef SF_USECODEPAGE
+#define SF_USECODEPAGE 0x0020
+#endif
+#ifndef CP_UTF8
+#define CP_UTF8 65001
+#endif
 
 /* Plain-text streaming must carry SF_UNICODE on Unicode controls:
    without it the control transfers ANSI (UTF-16 bytes streamed in
@@ -1539,6 +1545,9 @@ typedef struct
     StrBuf fld_result;
     RtfGroup stack[RTF_MAX_DEPTH];
     int depth;
+    /* \'xx codepage (from \ansicpgN, default 1252) + \ucN fallback count */
+    int ansi_cp;
+    int uc;
     /* fonttbl -> monospace mapping (controls renumber fonts) */
     int fonttbl_depth;
     int font_entry;
@@ -2284,6 +2293,198 @@ rtf_hex_val(char c)
     return c - 'A' + 10;
 }
 
+/*
+ * Codepage-aware \'xx handling (DBCS fix).
+ *
+ * RTF \'xx bytes are in the document codepage (\ansicpgN, e.g. 950
+ * for Big5 where 0xA1 0xF7 is U+2192 RIGHTWARDS ARROW). Decoding
+ * them always as Win1252 turns that arrow into U+00A1 U+00F7
+ * ("¡÷"). Keep the Win1252 fast path for the default 1252 case;
+ * otherwise convert whole runs via the declared codepage to UTF-8.
+ * \uN fallback bytes are skipped (not decoded) so \u8594\'a1\'f7
+ * yields a single arrow instead of "arrow + mojibake".
+ */
+
+static int
+rtf_is_dbcs_lead(int cp, unsigned char b)
+{
+    if (cp == 1252 || cp == 65001 || cp <= 0)
+        return 0;
+    if (b < 0x81 || b == 0xFF)
+        return 0;
+    return IsDBCSLeadByteEx((UINT)cp, (BYTE)b) != 0;
+}
+
+static int
+rtf_append_ansi_bytes(RtfParse *st, const unsigned char *bytes, int n)
+{
+    WCHAR *w;
+    char *u;
+    int wn;
+    int un;
+    int ok;
+
+    if (n <= 0)
+        return 1;
+    if (st->depth > 0 && st->stack[st->depth - 1].ignore)
+        return 1;
+    if (st->in_field && st->in_fldinst)
+        return 1;
+    if (st->ansi_cp == 1252)
+    {
+        int k;
+        unsigned long cp;
+        char ub[5];
+        int nb;
+
+        k = 0;
+        while (k < n)
+        {
+            cp = win1252_to_unicode(bytes[k]);
+            nb = utf8_encode(cp, ub);
+            if (st->in_field && st->in_fldrslt)
+            {
+                if (!sb_append_n(&st->fld_result, ub, (size_t)nb))
+                    return 0;
+            }
+            else
+            {
+                if (!rtf_append_plain(st, ub, (size_t)nb))
+                    return 0;
+            }
+            k++;
+        }
+        return 1;
+    }
+    wn = MultiByteToWideChar((UINT)st->ansi_cp, 0,
+                             (LPCSTR)bytes, n, NULL, 0);
+    if (wn <= 0)
+    {
+        int k;
+        unsigned long cp;
+        char ub[5];
+        int nb;
+
+        /* e.g. lone 0x95 bullet on a DBCS system: fall back to 1252 */
+        k = 0;
+        while (k < n)
+        {
+            cp = win1252_to_unicode(bytes[k]);
+            nb = utf8_encode(cp, ub);
+            if (st->in_field && st->in_fldrslt)
+            {
+                if (!sb_append_n(&st->fld_result, ub, (size_t)nb))
+                    return 0;
+            }
+            else
+            {
+                if (!rtf_append_plain(st, ub, (size_t)nb))
+                    return 0;
+            }
+            k++;
+        }
+        return 1;
+    }
+    w = (WCHAR *)malloc((size_t)(wn + 1) * sizeof(WCHAR));
+    if (w == NULL)
+        return 0;
+    if (MultiByteToWideChar((UINT)st->ansi_cp, 0,
+                            (LPCSTR)bytes, n, w, wn) <= 0)
+    {
+        free(w);
+        return 1;
+    }
+    w[wn] = 0;
+    un = WideCharToMultiByte(CP_UTF8, 0, w, wn, NULL, 0, NULL, NULL);
+    if (un <= 0)
+    {
+        free(w);
+        return 1;
+    }
+    u = (char *)malloc((size_t)un + 1);
+    if (u == NULL)
+    {
+        free(w);
+        return 0;
+    }
+    if (WideCharToMultiByte(CP_UTF8, 0, w, wn, u, un, NULL, NULL) <= 0)
+    {
+        free(w);
+        free(u);
+        return 1;
+    }
+    free(w);
+    u[un] = '\0';
+    if (st->in_field && st->in_fldrslt)
+        ok = sb_append_n(&st->fld_result, u, (size_t)un);
+    else
+        ok = rtf_append_plain(st, u, (size_t)un);
+    free(u);
+    return ok;
+}
+
+static void
+rtf_skip_u_fallback(const char *rtf, size_t len, size_t *pi,
+                    int uc, int ansi_cp)
+{
+    size_t i;
+    int k;
+
+    i = *pi;
+    k = 0;
+    while (k < uc && i < len)
+    {
+        if (i + 3 < len && rtf[i] == '\\' && rtf[i + 1] == '\'' &&
+            rtf_is_hex(rtf[i + 2]) && rtf_is_hex(rtf[i + 3]))
+        {
+            unsigned char b;
+
+            b = (unsigned char)(rtf_hex_val(rtf[i + 2]) * 16 +
+                                rtf_hex_val(rtf[i + 3]));
+            i += 4;
+            if (ansi_cp == 65001)
+            {
+                int t;
+
+                /* UTF-8 fallback: one char is up to 4 bytes */
+                t = 0;
+                while (t < 3 && i + 3 < len && rtf[i] == '\\' &&
+                       rtf[i + 1] == '\'' &&
+                       rtf_is_hex(rtf[i + 2]) &&
+                       rtf_is_hex(rtf[i + 3]))
+                {
+                    /* stop unless continuation byte 0x80-0xBF */
+                    b = (unsigned char)(rtf_hex_val(rtf[i + 2]) * 16 +
+                                        rtf_hex_val(rtf[i + 3]));
+                    if (b < 0x80 || b > 0xBF)
+                        break;
+                    i += 4;
+                    t++;
+                }
+            }
+            else if (rtf_is_dbcs_lead(ansi_cp, b))
+            {
+                if (i + 3 < len && rtf[i] == '\\' &&
+                    rtf[i + 1] == '\'' &&
+                    rtf_is_hex(rtf[i + 2]) &&
+                    rtf_is_hex(rtf[i + 3]))
+                    i += 4;
+            }
+            k++;
+        }
+        else if (rtf[i] != '\\' && rtf[i] != '{' && rtf[i] != '}')
+        {
+            i++;
+            k++;
+        }
+        else
+        {
+            break;
+        }
+    }
+    *pi = i;
+}
+
 static char *
 rtf_to_md(const char *rtf)
 {
@@ -2308,6 +2509,8 @@ rtf_to_md(const char *rtf)
     st.cell_idx = 0;
     st.field_depth = -1;
     st.depth = 0;
+    st.ansi_cp = 1252;
+    st.uc = 1;
     st.fonttbl_depth = -1;
     st.font_entry = -1;
     st.font_namelen = 0;
@@ -2434,32 +2637,73 @@ rtf_to_md(const char *rtf)
                 if (i + 3 < len && rtf_is_hex(rtf[i + 2]) &&
                     rtf_is_hex(rtf[i + 3]))
                 {
-                    unsigned char b;
-                    unsigned long cp;
-                    char ub[5];
-                    int nb;
-
-                    b = (unsigned char)(rtf_hex_val(rtf[i + 2]) * 16 +
-                                        rtf_hex_val(rtf[i + 3]));
-                    cp = win1252_to_unicode(b);
-                    nb = utf8_encode(cp, ub);
-                    if (!(st.depth > 0 &&
-                          st.stack[st.depth - 1].ignore))
+                    if (st.ansi_cp == 1252)
                     {
-                        if (st.in_field && st.in_fldinst)
+                        unsigned char b;
+                        unsigned long cp;
+                        char ub[5];
+                        int nb;
+
+                        b = (unsigned char)(rtf_hex_val(rtf[i + 2]) * 16 +
+                                            rtf_hex_val(rtf[i + 3]));
+                        cp = win1252_to_unicode(b);
+                        nb = utf8_encode(cp, ub);
+                        if (!(st.depth > 0 &&
+                              st.stack[st.depth - 1].ignore))
                         {
+                            if (st.in_field && st.in_fldinst)
+                            {
+                            }
+                            else if (st.in_field && st.in_fldrslt)
+                            {
+                                sb_append_n(&st.fld_result, ub, (size_t)nb);
+                            }
+                            else
+                            {
+                                rtf_append_plain(&st, ub, (size_t)nb);
+                            }
                         }
-                        else if (st.in_field && st.in_fldrslt)
-                        {
-                            sb_append_n(&st.fld_result, ub, (size_t)nb);
-                        }
-                        else
-                        {
-                            rtf_append_plain(&st, ub, (size_t)nb);
-                        }
+                        i += 4;
+                        continue;
                     }
-                    i += 4;
-                    continue;
+                    else
+                    {
+                        size_t k;
+                        int nbytes;
+                        int t;
+                        unsigned char *abuf;
+
+                        nbytes = 0;
+                        k = i;
+                        while (k + 3 < len && rtf[k] == '\\' &&
+                               rtf[k + 1] == '\'' &&
+                               rtf_is_hex(rtf[k + 2]) &&
+                               rtf_is_hex(rtf[k + 3]))
+                        {
+                            nbytes++;
+                            k += 4;
+                        }
+                        abuf = (unsigned char *)malloc((size_t)nbytes);
+                        if (abuf == NULL)
+                        {
+                            i += 4;
+                            continue;
+                        }
+                        t = 0;
+                        k = i;
+                        while (t < nbytes)
+                        {
+                            abuf[t] = (unsigned char)
+                                (rtf_hex_val(rtf[k + 2]) * 16 +
+                                 rtf_hex_val(rtf[k + 3]));
+                            t++;
+                            k += 4;
+                        }
+                        rtf_append_ansi_bytes(&st, abuf, nbytes);
+                        free(abuf);
+                        i = k;
+                        continue;
+                    }
                 }
                 i += 2;
                 continue;
@@ -2717,10 +2961,8 @@ rtf_to_md(const char *rtf)
                             rtf_append_plain(&st, ub, (size_t)nb);
                         }
                     }
-                    /* skip single fallback char */
-                    if (i < len && rtf[i] != '\\' &&
-                        rtf[i] != '{' && rtf[i] != '}')
-                        i++;
+                    /* skip \ucN fallback chars (DBCS-aware, see helper) */
+                    rtf_skip_u_fallback(rtf, len, &i, st.uc, st.ansi_cp);
                 }
                 else if (strcmp(word, "tab") == 0)
                 {
@@ -2801,6 +3043,18 @@ rtf_to_md(const char *rtf)
                     st.in_fldrslt = 1;
                     st.fldrslt_depth = st.depth;
                     st.in_fldinst = 0;
+                }
+                else if (strcmp(word, "ansicpg") == 0)
+                {
+                    if (has_param && param > 0 && param < 65536)
+                        st.ansi_cp = (int)param;
+                }
+                else if (strcmp(word, "uc") == 0)
+                {
+                    if (has_param && param >= 0 && param <= 8)
+                        st.uc = (int)param;
+                    else if (!has_param)
+                        st.uc = 1;
                 }
                 else if (strcmp(word, "fonttbl") == 0)
                 {
@@ -3478,6 +3732,7 @@ SaveMarkdown(HWND hwndEdit, LPCTSTR filename)
     char *rtf;
     char *md;
     int ok;
+    WPARAM tryfmt;
 
     if (g_showSource)
     {
@@ -3509,10 +3764,32 @@ SaveMarkdown(HWND hwndEdit, LPCTSTR filename)
     memset(&es, 0, sizeof(es));
     es.dwCookie = (DWORD_PTR)&m;
     es.pfnCallback = StreamOutMemCallback;
+    /* Prefer UTF-8 RTF on 3.0+ (codepage-independent); fall back
+       to system codepage RTF on 2.0 or earlier. */
+    tryfmt = (WPARAM)(((DWORD)CP_UTF8 << 16) |
+                      (SF_RTF | SF_USECODEPAGE));
     SendMessage(hwndEdit,
                 EM_STREAMOUT,
-                (WPARAM)SF_RTF,
+                tryfmt,
                 (LPARAM)&es);
+    if (es.dwError != 0 || m.failed)
+    {
+        if (m.buf != NULL)
+        {
+            free(m.buf);
+            m.buf = NULL;
+        }
+        m.len = 0;
+        m.cap = 0;
+        m.failed = 0;
+        memset(&es, 0, sizeof(es));
+        es.dwCookie = (DWORD_PTR)&m;
+        es.pfnCallback = StreamOutMemCallback;
+        SendMessage(hwndEdit,
+                    EM_STREAMOUT,
+                    (WPARAM)SF_RTF,
+                    (LPARAM)&es);
+    }
     if (es.dwError != 0 || m.failed)
     {
         if (m.buf != NULL)
@@ -3676,11 +3953,45 @@ stream_editor_out(HWND hwndEdit, WPARAM fmt)
 {
     MemOut m;
     EDITSTREAM es;
+    WPARAM tryfmt;
 
     memset(&m, 0, sizeof(m));
     memset(&es, 0, sizeof(es));
     es.dwCookie = (DWORD_PTR)&m;
     es.pfnCallback = StreamOutMemCallback;
+    if (fmt == SF_RTF)
+    {
+        /* RichEdit 3.0+: request UTF-8 RTF (\ansicpg65001) so \'xx
+           bytes are codepage-independent; 2.0 or earlier ignores
+           SF_USECODEPAGE and fails, then we fall back to plain
+           SF_RTF (system codepage, handled via \ansicpg). */
+        tryfmt = (WPARAM)(((DWORD)CP_UTF8 << 16) |
+                          (SF_RTF | SF_USECODEPAGE));
+        SendMessage(hwndEdit, EM_STREAMOUT, tryfmt, (LPARAM)&es);
+        if (es.dwError == 0 && !m.failed)
+        {
+            if (m.buf == NULL)
+            {
+                m.buf = (char *)malloc(2);
+                if (m.buf == NULL)
+                    return NULL;
+                m.buf[0] = '\0';
+                m.buf[1] = '\0';
+            }
+            return m.buf;
+        }
+        if (m.buf != NULL)
+        {
+            free(m.buf);
+            m.buf = NULL;
+        }
+        m.len = 0;
+        m.cap = 0;
+        m.failed = 0;
+        memset(&es, 0, sizeof(es));
+        es.dwCookie = (DWORD_PTR)&m;
+        es.pfnCallback = StreamOutMemCallback;
+    }
     SendMessage(hwndEdit, EM_STREAMOUT, fmt, (LPARAM)&es);
     if (es.dwError != 0 || m.failed)
     {
