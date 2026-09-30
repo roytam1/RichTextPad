@@ -71,6 +71,12 @@ The converters cover a deliberate subset and normalize on load:
   other `{\*…}` destinations, so code blocks and links survive.
 - Not supported: nested lists, images (kept as links),
   reference-style links, footnotes, strikethrough, task lists.
+- RichEdit 1.0 (`RICHED32.DLL`, last-resort fallback when neither
+  Msftedit nor `RICHED20` loads) is degraded: links render as plain
+  dead text (no `EN_LINK`/`CFE_LINK`/auto-URL support), non-ASCII
+  shows as `?` (no `\uN`), tables flatten to plain text, and text
+  entry is capped at 64K. Opening and re-saving a `.md` there can
+  bake those losses into the file.
 
 ## Layout
 

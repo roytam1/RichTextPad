@@ -127,6 +127,7 @@ static HMODULE     g_hRichEdit;
 static const char *g_editClass;
 static char       g_filename[MAX_PATH];
 static int        g_showSource;
+static int        g_isRE10;
 
 static void reset_source_format(void);
 static void apply_link_effects(const char *md);
@@ -1382,8 +1383,11 @@ md_to_rtf(const char *md)
                     indent = 4;
                 li = 360 + indent * 360;
                 sprintf(tmp, "\\pard\\li%d\\fi-360 ", li);
+                /* \'95 (Win1252 bullet), not \u8226?: RichEdit 1.0
+                   has no \uN support; rtf_to_md maps \'95 back to
+                   U+2022, so lists survive on every version. */
                 ok = sb_append_str(&out, tmp) &&
-                     sb_append_str(&out, "\\u8226? ") &&
+                     sb_append_str(&out, "\\'95 ") &&
                      md_inline_to_rtf(&out, c2) &&
                      sb_append_str(&out, "\\par ");
                 free(line);
@@ -4597,17 +4601,31 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                         (LPARAM)0x7ffffffe);
 
             /*
+             * RichEdit 1.0 ignores EM_EXLIMITTEXT: also send the
+             * original EM_LIMITTEXT (byte count on 1.0).
+             * Harmless on newer controls.
+             */
+            SendMessage(g_hwndEdit,
+                        EM_LIMITTEXT,
+                        (WPARAM)64000,
+                        0);
+
+            /*
              * EN_LINK notifications make HYPERLINK fields (markdown
              * links) and auto-detected URLs clickable (see WM_NOTIFY).
+             * Both need RichEdit 2.0+, so skip them on 1.0.
              */
-            evmask = (DWORD)SendMessage(g_hwndEdit,
-                                        EM_GETEVENTMASK, 0, 0);
-            SendMessage(g_hwndEdit,
-                        EM_SETEVENTMASK, 0,
-                        (LPARAM)(evmask | ENM_LINK));
-            SendMessage(g_hwndEdit,
-                        EM_AUTOURLDETECT,
-                        (WPARAM)TRUE, 0);
+            if (!g_isRE10)
+            {
+                evmask = (DWORD)SendMessage(g_hwndEdit,
+                                            EM_GETEVENTMASK, 0, 0);
+                SendMessage(g_hwndEdit,
+                            EM_SETEVENTMASK, 0,
+                            (LPARAM)(evmask | ENM_LINK));
+                SendMessage(g_hwndEdit,
+                            EM_AUTOURLDETECT,
+                            (WPARAM)TRUE, 0);
+            }
 
             return 0;
         }
@@ -4724,6 +4742,7 @@ WinMain(HINSTANCE hInstance,
     HWND hwnd;
     MSG msg;
     HMENU menu;
+    UINT oldErrMode;
     char cmdFile[MAX_PATH];
 
     (void)hPrevInstance;
@@ -4735,10 +4754,15 @@ WinMain(HINSTANCE hInstance,
     g_editClass = NULL;
     g_filename[0] = '\0';
     g_showSource = 0;
+    g_isRE10 = 0;
 
+    /* Disable Error Dialog when DLL is not found */
+    oldErrMode = SetErrorMode(SEM_NOOPENFILEERRORBOX);
     /*
      * Prefer Msftedit (RichEdit 4.1+, best table support) and fall back
      * to RICHED20 (2.0 on old systems, 3.0+ on XP and later, tables OK).
+     * RICHED32 (1.0) is a degraded last resort (sets g_isRE10):
+     * no links, no tables, no Unicode, 64K text cap.
      *
      * Msftedit only provides the Unicode RICHEDIT50W class, but byte
      * based SF_RTF streaming still works from this ANSI app.
@@ -4758,9 +4782,12 @@ WinMain(HINSTANCE hInstance,
         if (g_hRichEdit == NULL) {
             g_hRichEdit = LoadLibrary("RICHED32.DLL");
             g_editClass = "RICHEDIT";
+            g_isRE10 = 1;
         }
     }
 
+    /* Restore old Error Mode */
+    SetErrorMode(oldErrMode);
     if (g_hRichEdit == NULL)
     {
         MessageBox(NULL,
