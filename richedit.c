@@ -1546,7 +1546,6 @@ typedef struct
     int font_namelen;
     int fonts_mono[RTF_MAX_FONTS];
     int fonts_tbl;
-    int fonts_mono_any;
 } RtfParse;
 
 static unsigned long
@@ -2672,9 +2671,11 @@ rtf_to_md(const char *rtf)
                             st.font_entry = -1;
                         st.font_namelen = 0;
                     }
+                    /* Mono by fonttbl name only: controls add their
+                       own fonts (e.g. Cambria Math for missing
+                       glyphs), so a bare \f1 proves nothing. */
                     else if (has_param &&
-                             ((param == 1 && !st.fonts_mono_any) ||
-                              is_mono_font(&st, (int)param)))
+                             is_mono_font(&st, (int)param))
                         rtf_toggle_mono(&st, 1);
                     else
                         rtf_toggle_mono(&st, 0);
@@ -2884,8 +2885,6 @@ rtf_to_md(const char *rtf)
                                 ismono =
                                     is_mono_font_name(st.font_name);
                                 st.fonts_mono[st.font_entry] = ismono;
-                                if (ismono)
-                                    st.fonts_mono_any = 1;
                             }
                             st.font_entry = -1;
                             st.font_namelen = 0;
@@ -3085,7 +3084,9 @@ StreamOutMemCallback(DWORD_PTR dwCookie, LPBYTE pbBuff,
         *pcb = 0;
         return 1;
     }
-    need = m->len + cb + 1;
+    /* +2: keep two spare NUL bytes so the buffer also terminates
+       a WCHAR string for the Unicode text path. */
+    need = m->len + cb + 2;
     if (need > m->cap)
     {
         LONG newcap;
@@ -3107,6 +3108,7 @@ StreamOutMemCallback(DWORD_PTR dwCookie, LPBYTE pbBuff,
     memcpy(m->buf + m->len, pbBuff, (size_t)cb);
     m->len += cb;
     m->buf[m->len] = '\0';
+    m->buf[m->len + 1] = '\0';
     *pcb = cb;
     return 0;
 }
@@ -3688,10 +3690,13 @@ stream_editor_out(HWND hwndEdit, WPARAM fmt)
     }
     if (m.buf == NULL)
     {
-        m.buf = (char *)malloc(1);
+        /* Two NULs: also terminates an empty WCHAR string for the
+           Unicode text path (single byte would over-read heap). */
+        m.buf = (char *)malloc(2);
         if (m.buf == NULL)
             return NULL;
         m.buf[0] = '\0';
+        m.buf[1] = '\0';
     }
     return m.buf;
 }
