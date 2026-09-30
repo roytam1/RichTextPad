@@ -61,6 +61,9 @@
 #ifndef SCF_ALL
 #define SCF_ALL 0x0004
 #endif
+#ifndef RICHEDIT_CLASS
+#define RICHEDIT_CLASS "RichEdit20W"
+#endif
 #ifndef RICHEDIT_CLASSA
 #define RICHEDIT_CLASSA "RichEdit20A"
 #endif
@@ -5155,7 +5158,13 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
             g_hwndEdit = CreateWindowEx(
                 WS_EX_CLIENTEDGE,
-                g_editClass != NULL ? g_editClass : RICHEDIT_CLASS,
+                g_editClass != NULL ? g_editClass : 
+#ifdef UNICODE
+                RICHEDIT_CLASS
+#else
+                RICHEDIT_CLASSA
+#endif
+                ,
                 _T(""),
                 WS_CHILD |
                 WS_VISIBLE |
@@ -5368,7 +5377,11 @@ APP_ENTRY(HINSTANCE hInstance,
     else
     {
         g_hRichEdit = LoadLibrary(_T("RICHED20.DLL"));
+#ifdef UNICODE
         g_editClass = RICHEDIT_CLASS;
+#else
+        g_editClass = RICHEDIT_CLASSA;
+#endif
 #ifndef UNICODE
         /* RichEdit 1.0 is ANSI-only: no Unicode build fallback. */
         if (g_hRichEdit == NULL) {
