@@ -3771,6 +3771,7 @@ SaveMarkdown(HWND hwndEdit, LPCTSTR filename)
     char *md;
     int ok;
     WPARAM tryfmt;
+    LRESULT res;
 
     if (g_showSource)
     {
@@ -3806,11 +3807,11 @@ SaveMarkdown(HWND hwndEdit, LPCTSTR filename)
        to system codepage RTF on 2.0 or earlier. */
     tryfmt = (WPARAM)(((DWORD)CP_UTF8 << 16) |
                       (SF_RTF | SF_USECODEPAGE));
-    SendMessage(hwndEdit,
+    res = SendMessage(hwndEdit,
                 EM_STREAMOUT,
                 tryfmt,
                 (LPARAM)&es);
-    if (es.dwError != 0 || m.failed)
+    if (es.dwError != 0 || m.failed || !res)
     {
         if (m.buf != NULL)
         {
@@ -3992,6 +3993,7 @@ stream_editor_out(HWND hwndEdit, WPARAM fmt)
     MemOut m;
     EDITSTREAM es;
     WPARAM tryfmt;
+    LRESULT res;
 
     memset(&m, 0, sizeof(m));
     memset(&es, 0, sizeof(es));
@@ -4005,8 +4007,8 @@ stream_editor_out(HWND hwndEdit, WPARAM fmt)
            SF_RTF (system codepage, handled via \ansicpg). */
         tryfmt = (WPARAM)(((DWORD)CP_UTF8 << 16) |
                           (SF_RTF | SF_USECODEPAGE));
-        SendMessage(hwndEdit, EM_STREAMOUT, tryfmt, (LPARAM)&es);
-        if (es.dwError == 0 && !m.failed)
+        res = SendMessage(hwndEdit, EM_STREAMOUT, tryfmt, (LPARAM)&es);
+        if (es.dwError == 0 && !m.failed && res)
         {
             if (m.buf == NULL)
             {
@@ -4349,6 +4351,7 @@ utf8_to_ansi(const char *s)
 static char *
 stream_editor_text_out(HWND hwndEdit)
 {
+    LRESULT res;
 #ifdef UNICODE
     char *raw;
     char *utf8;
@@ -4372,8 +4375,8 @@ stream_editor_text_out(HWND hwndEdit)
     es.pfnCallback = StreamOutMemCallback;
     tryfmt = (WPARAM)(((DWORD)CP_UTF8 << 16) |
                       (SF_TEXT | SF_USECODEPAGE));
-    SendMessage(hwndEdit, EM_STREAMOUT, tryfmt, (LPARAM)&es);
-    if (es.dwError == 0 && !m.failed)
+    res = SendMessage(hwndEdit, EM_STREAMOUT, tryfmt, (LPARAM)&es);
+    if (es.dwError == 0 && !m.failed && res)
     {
         if (m.buf == NULL)
         {
