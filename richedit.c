@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <tchar.h>
 
 #ifndef IDC_HAND
 #define IDC_HAND MAKEINTRESOURCE(32649)
@@ -104,8 +105,8 @@ typedef struct _findtextexw {
 } FINDTEXTEXW;
 #endif
 
-#define WNDCLASS_NAME "RichTextPad"
-#define WND_TITLE "RichTextPad"
+#define WNDCLASS_NAME _T("RichTextPad")
+#define WND_TITLE _T("RichTextPad")
 
 #define IDM_OPEN        100
 #define IDM_SAVE        101
@@ -124,13 +125,15 @@ static HINSTANCE g_hInst;
 static HWND       g_hwndMain;
 static HWND       g_hwndEdit;
 static HMODULE     g_hRichEdit;
-static const char *g_editClass;
-static char       g_filename[MAX_PATH];
+static LPCTSTR     g_editClass;
+static TCHAR       g_filename[MAX_PATH];
 static int        g_showSource;
 static int        g_isRE10;
 
 static void reset_source_format(void);
 static void apply_link_effects(const char *md);
+static char *stream_editor_text_out(HWND hwndEdit);
+static int stream_editor_text_in(HWND hwndEdit, const char *text);
 
 /*
  * ----------------------------------------------------------------------
@@ -141,15 +144,15 @@ static void apply_link_effects(const char *md);
 static void
 UpdateTitle(void)
 {
-    char title[MAX_PATH + 32];
+    TCHAR title[MAX_PATH + 32];
 
-    if (g_filename[0] == '\0')
+    if (g_filename[0] == _T('\0'))
     {
-        strcpy(title, WND_TITLE " - Untitled");
+        _tcscpy(title, WND_TITLE _T(" - Untitled"));
     }
     else
     {
-        sprintf(title, "%s - %s", WND_TITLE, g_filename);
+        _stprintf(title, _T("%s - %s"), WND_TITLE, g_filename);
     }
 
     if (g_hwndMain != NULL)
@@ -165,10 +168,10 @@ UpdateTitle(void)
  */
 
 static int
-GetCmdLineFile(LPSTR lpCmdLine, char *out, int outSize)
+GetCmdLineFile(LPTSTR lpCmdLine, LPTSTR out, int outSize)
 {
-    char *p;
-    char *end;
+    TCHAR *p;
+    TCHAR *end;
     size_t len;
 
     if (lpCmdLine == NULL || out == NULL || outSize <= 1)
@@ -176,37 +179,37 @@ GetCmdLineFile(LPSTR lpCmdLine, char *out, int outSize)
 
     p = lpCmdLine;
 
-    while (*p == ' ' || *p == '\t')
+    while (*p == _T(' ') || *p == _T('\t'))
         p++;
 
-    if (*p == '\0')
+    if (*p == _T('\0'))
         return 0;
 
-    if (*p == '"')
+    if (*p == _T('"'))
     {
         p++;
-        end = strchr(p, '"');
+        end = _tcschr(p, _T('"'));
         if (end != NULL)
             len = (size_t)(end - p);
         else
-            len = strlen(p);
+            len = _tcslen(p);
     }
     else
     {
         /* Take whole remainder so paths with spaces work even unquoted. */
-        end = p + strlen(p);
-        while (end > p && (*(end - 1) == ' ' || *(end - 1) == '\t'))
+        end = p + _tcslen(p);
+        while (end > p && (*(end - 1) == _T(' ') || *(end - 1) == _T('\t')))
             end--;
         len = (size_t)(end - p);
         /* Strip one pair of surrounding quotes, just in case. */
-        if (len >= 2 && p[0] == '"' && p[len - 1] == '"')
+        if (len >= 2 && p[0] == _T('"') && p[len - 1] == _T('"'))
         {
             p++;
             len -= 2;
         }
     }
 
-    while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t'))
+    while (len > 0 && (p[len - 1] == _T(' ') || p[len - 1] == _T('\t')))
         len--;
 
     if (len == 0)
@@ -215,8 +218,8 @@ GetCmdLineFile(LPSTR lpCmdLine, char *out, int outSize)
     if (len > (size_t)(outSize - 1))
         len = (size_t)(outSize - 1);
 
-    memcpy(out, p, len);
-    out[len] = '\0';
+    memcpy(out, p, len * sizeof(TCHAR));
+    out[len] = _T('\0');
 
     return 1;
 }
@@ -3096,7 +3099,7 @@ StreamOutMemCallback(DWORD_PTR dwCookie, LPBYTE pbBuff,
 }
 
 static char *
-read_entire_file(const char *path, size_t *out_len)
+read_entire_file(LPCTSTR path, size_t *out_len)
 {
     FILE *fp;
     long sz;
@@ -3104,7 +3107,7 @@ read_entire_file(const char *path, size_t *out_len)
     char *buf;
     size_t got;
 
-    fp = fopen(path, "rb");
+    fp = _tfopen(path, _T("rb"));
     if (fp == NULL)
         return NULL;
     if (fseek(fp, 0, SEEK_END) != 0)
@@ -3135,13 +3138,13 @@ read_entire_file(const char *path, size_t *out_len)
 }
 
 static int
-write_entire_file(const char *path, const char *data)
+write_entire_file(LPCTSTR path, const char *data)
 {
     FILE *fp;
     size_t len;
     size_t wrote;
 
-    fp = fopen(path, "wb");
+    fp = _tfopen(path, _T("wb"));
     if (fp == NULL)
         return 0;
     len = strlen(data);
@@ -3151,27 +3154,27 @@ write_entire_file(const char *path, const char *data)
 }
 
 static int
-has_ext_ci(const char *filename, const char *ext)
+has_ext_ci(LPCTSTR filename, LPCTSTR ext)
 {
     size_t fl;
     size_t el;
 
-    fl = strlen(filename);
-    el = strlen(ext);
+    fl = _tcslen(filename);
+    el = _tcslen(ext);
     if (el >= fl)
         return 0;
     filename += fl - el;
-    while (*ext != '\0')
+    while (*ext != _T('\0'))
     {
-        char a;
-        char b;
+        TCHAR a;
+        TCHAR b;
 
         a = *filename;
         b = *ext;
-        if (a >= 'A' && a <= 'Z')
-            a = (char)(a + 32);
-        if (b >= 'A' && b <= 'Z')
-            b = (char)(b + 32);
+        if (a >= _T('A') && a <= _T('Z'))
+            a = (TCHAR)(a + 32);
+        if (b >= _T('A') && b <= _T('Z'))
+            b = (TCHAR)(b + 32);
         if (a != b)
             return 0;
         filename++;
@@ -3181,17 +3184,17 @@ has_ext_ci(const char *filename, const char *ext)
 }
 
 static int
-is_markdown_file(const char *filename)
+is_markdown_file(LPCTSTR filename)
 {
-    if (has_ext_ci(filename, ".md"))
+    if (has_ext_ci(filename, _T(".md")))
         return 1;
-    if (has_ext_ci(filename, ".markdown"))
+    if (has_ext_ci(filename, _T(".markdown")))
         return 1;
-    if (has_ext_ci(filename, ".mkd"))
+    if (has_ext_ci(filename, _T(".mkd")))
         return 1;
-    if (has_ext_ci(filename, ".mdown"))
+    if (has_ext_ci(filename, _T(".mdown")))
         return 1;
-    if (has_ext_ci(filename, ".txt"))
+    if (has_ext_ci(filename, _T(".txt")))
         return 1;
     return 0;
 }
@@ -3203,7 +3206,7 @@ is_markdown_file(const char *filename)
  */
 
 static int
-LoadRTF(HWND hwndEdit, const char *filename)
+LoadRTF(HWND hwndEdit, LPCTSTR filename)
 {
     FILE *fp;
     EDITSTREAM es;
@@ -3212,14 +3215,13 @@ LoadRTF(HWND hwndEdit, const char *filename)
     {
         char *rtf;
         char *md;
-        MemIn m;
 
         rtf = read_entire_file(filename, NULL);
         if (rtf == NULL)
         {
             MessageBox(hwndEdit,
-                       "Unable to open the RTF file.",
-                       "Open",
+                       _T("Unable to open the RTF file."),
+                       _T("Open"),
                        MB_OK | MB_ICONERROR);
             return 0;
         }
@@ -3228,45 +3230,35 @@ LoadRTF(HWND hwndEdit, const char *filename)
         if (md == NULL)
         {
             MessageBox(hwndEdit,
-                       "Out of memory.",
-                       "Open",
+                       _T("Out of memory."),
+                       _T("Open"),
                        MB_OK | MB_ICONERROR);
             return 0;
         }
-        memset(&m, 0, sizeof(m));
-        m.buf = md;
-        m.len = (LONG)strlen(md);
-        m.pos = 0;
-        memset(&es, 0, sizeof(es));
-        es.dwCookie = (DWORD_PTR)&m;
-        es.pfnCallback = StreamInMemCallback;
-        SendMessage(hwndEdit,
-                    EM_STREAMIN,
-                    (WPARAM)SF_TEXT,
-                    (LPARAM)&es);
-        free(md);
-        if (es.dwError != 0)
+        if (!stream_editor_text_in(hwndEdit, md))
         {
+            free(md);
             MessageBox(hwndEdit,
-                       "Unable to load the RTF file.",
-                       "Open",
+                       _T("Unable to load the RTF file."),
+                       _T("Open"),
                        MB_OK | MB_ICONERROR);
             return 0;
         }
-        strncpy(g_filename, filename, MAX_PATH - 1);
-        g_filename[MAX_PATH - 1] = '\0';
+        free(md);
+        _tcsncpy(g_filename, filename, MAX_PATH - 1);
+        g_filename[MAX_PATH - 1] = _T('\0');
         UpdateTitle();
         reset_source_format();
         return 1;
     }
 
-    fp = fopen(filename, "rb");
+    fp = _tfopen(filename, _T("rb"));
 
     if (fp == NULL)
     {
         MessageBox(hwndEdit,
-                   "Unable to open the RTF file.",
-                   "Open",
+                   _T("Unable to open the RTF file."),
+                   _T("Open"),
                    MB_OK | MB_ICONERROR);
         return 0;
     }
@@ -3286,14 +3278,14 @@ LoadRTF(HWND hwndEdit, const char *filename)
     if (es.dwError != 0)
     {
         MessageBox(hwndEdit,
-                   "Unable to load the RTF file.",
-                   "Open",
+                   _T("Unable to load the RTF file."),
+                   _T("Open"),
                    MB_OK | MB_ICONERROR);
         return 0;
     }
 
-    strncpy(g_filename, filename, MAX_PATH - 1);
-    g_filename[MAX_PATH - 1] = '\0';
+    _tcsncpy(g_filename, filename, MAX_PATH - 1);
+    g_filename[MAX_PATH - 1] = _T('\0');
 
     UpdateTitle();
 
@@ -3301,85 +3293,61 @@ LoadRTF(HWND hwndEdit, const char *filename)
 }
 
 static int
-SaveRTF(HWND hwndEdit, const char *filename)
+SaveRTF(HWND hwndEdit, LPCTSTR filename)
 {
     FILE *fp;
     EDITSTREAM es;
 
     if (g_showSource)
     {
-        MemOut m;
         char *md;
         char *rtf;
 
-        memset(&m, 0, sizeof(m));
-        memset(&es, 0, sizeof(es));
-        es.dwCookie = (DWORD_PTR)&m;
-        es.pfnCallback = StreamOutMemCallback;
-        SendMessage(hwndEdit,
-                    EM_STREAMOUT,
-                    (WPARAM)SF_TEXT,
-                    (LPARAM)&es);
-        if (es.dwError != 0 || m.failed)
-        {
-            if (m.buf != NULL)
-                free(m.buf);
-            MessageBox(hwndEdit,
-                       "Unable to save the RTF file.",
-                       "Save",
-                       MB_OK | MB_ICONERROR);
-            return 0;
-        }
-        md = m.buf != NULL ? m.buf : NULL;
+        md = stream_editor_text_out(hwndEdit);
         if (md == NULL)
         {
-            md = (char *)malloc(1);
-            if (md == NULL)
-            {
-                MessageBox(hwndEdit,
-                           "Out of memory.",
-                           "Save",
-                           MB_OK | MB_ICONERROR);
-                return 0;
-            }
-            md[0] = '\0';
+            MessageBox(hwndEdit,
+                       _T("Unable to save the RTF file."),
+                       _T("Save"),
+                       MB_OK | MB_ICONERROR);
+            return 0;
         }
         rtf = md_to_rtf(md);
         free(md);
         if (rtf == NULL)
         {
             MessageBox(hwndEdit,
-                       "Out of memory.",
-                       "Save",
+                       _T("Out of memory."),
+                       _T("Save"),
                        MB_OK | MB_ICONERROR);
             return 0;
         }
-        fp = fopen(filename, "wb");
+        fp = _tfopen(filename, _T("wb"));
         if (fp == NULL)
         {
             free(rtf);
             MessageBox(hwndEdit,
-                       "Unable to create the RTF file.",
-                       "Save",
+                       _T("Unable to create the RTF file."),
+                       _T("Save"),
                        MB_OK | MB_ICONERROR);
             return 0;
         }
         fwrite(rtf, 1, strlen(rtf), fp);
         fclose(fp);
         free(rtf);
-        strncpy(g_filename, filename, MAX_PATH - 1);
-        g_filename[MAX_PATH - 1] = '\0';
+        _tcsncpy(g_filename, filename, MAX_PATH - 1);
+        g_filename[MAX_PATH - 1] = _T('\0');
         UpdateTitle();
         return 1;
     }
 
-    fp = fopen(filename, "wb");
+    fp = _tfopen(filename, _T("wb"));
 
     if (fp == NULL)
     {
         MessageBox(hwndEdit,
-                   "Unable to create the RTF file.",
-                   "Save",
+                   _T("Unable to create the RTF file."),
+                   _T("Save"),
                    MB_OK | MB_ICONERROR);
         return 0;
     }
@@ -3399,14 +3367,14 @@ SaveRTF(HWND hwndEdit, const char *filename)
     if (es.dwError != 0)
     {
         MessageBox(hwndEdit,
-                   "Unable to save the RTF file.",
-                   "Save",
+                   _T("Unable to save the RTF file."),
+                   _T("Save"),
                    MB_OK | MB_ICONERROR);
         return 0;
     }
 
-    strncpy(g_filename, filename, MAX_PATH - 1);
-    g_filename[MAX_PATH - 1] = '\0';
+    _tcsncpy(g_filename, filename, MAX_PATH - 1);
+    g_filename[MAX_PATH - 1] = _T('\0');
 
     UpdateTitle();
 
@@ -3414,7 +3382,7 @@ SaveRTF(HWND hwndEdit, const char *filename)
 }
 
 static int
-LoadMarkdown(HWND hwndEdit, const char *filename)
+LoadMarkdown(HWND hwndEdit, LPCTSTR filename)
 {
     char *md;
     char *rtf;
@@ -3425,37 +3393,25 @@ LoadMarkdown(HWND hwndEdit, const char *filename)
     if (md == NULL)
     {
         MessageBox(hwndEdit,
-                   "Unable to open the file.",
-                   "Open",
+                   _T("Unable to open the file."),
+                   _T("Open"),
                    MB_OK | MB_ICONERROR);
         return 0;
     }
     if (g_showSource)
     {
-        MemIn m2;
-
-        memset(&m2, 0, sizeof(m2));
-        m2.buf = md;
-        m2.len = (LONG)strlen(md);
-        m2.pos = 0;
-        memset(&es, 0, sizeof(es));
-        es.dwCookie = (DWORD_PTR)&m2;
-        es.pfnCallback = StreamInMemCallback;
-        SendMessage(hwndEdit,
-                    EM_STREAMIN,
-                    (WPARAM)SF_TEXT,
-                    (LPARAM)&es);
-        free(md);
-        if (es.dwError != 0)
+        if (!stream_editor_text_in(hwndEdit, md))
         {
+            free(md);
             MessageBox(hwndEdit,
-                       "Unable to load the file.",
-                       "Open",
+                       _T("Unable to load the file."),
+                       _T("Open"),
                        MB_OK | MB_ICONERROR);
             return 0;
         }
-        strncpy(g_filename, filename, MAX_PATH - 1);
-        g_filename[MAX_PATH - 1] = '\0';
+        free(md);
+        _tcsncpy(g_filename, filename, MAX_PATH - 1);
+        g_filename[MAX_PATH - 1] = _T('\0');
         UpdateTitle();
         reset_source_format();
         return 1;
@@ -3465,8 +3421,8 @@ LoadMarkdown(HWND hwndEdit, const char *filename)
     {
         free(md);
         MessageBox(hwndEdit,
-                   "Out of memory.",
-                   "Open",
+                   _T("Out of memory."),
+                   _T("Open"),
                    MB_OK | MB_ICONERROR);
         return 0;
     }
@@ -3486,13 +3442,13 @@ LoadMarkdown(HWND hwndEdit, const char *filename)
     {
         free(md);
         MessageBox(hwndEdit,
-                   "Unable to load the file.",
-                   "Open",
+                   _T("Unable to load the file."),
+                   _T("Open"),
                    MB_OK | MB_ICONERROR);
         return 0;
     }
-    strncpy(g_filename, filename, MAX_PATH - 1);
-    g_filename[MAX_PATH - 1] = '\0';
+    _tcsncpy(g_filename, filename, MAX_PATH - 1);
+    g_filename[MAX_PATH - 1] = _T('\0');
     UpdateTitle();
     apply_link_effects(md);
     free(md);
@@ -3500,7 +3456,7 @@ LoadMarkdown(HWND hwndEdit, const char *filename)
 }
 
 static int
-SaveMarkdown(HWND hwndEdit, const char *filename)
+SaveMarkdown(HWND hwndEdit, LPCTSTR filename)
 {
     MemOut m;
     EDITSTREAM es;
@@ -3508,54 +3464,49 @@ SaveMarkdown(HWND hwndEdit, const char *filename)
     char *md;
     int ok;
 
-    memset(&m, 0, sizeof(m));
-    memset(&es, 0, sizeof(es));
-    es.dwCookie = (DWORD_PTR)&m;
-    es.pfnCallback = StreamOutMemCallback;
-    SendMessage(hwndEdit,
-                EM_STREAMOUT,
-                (WPARAM)(g_showSource ? SF_TEXT : SF_RTF),
-                (LPARAM)&es);
-    if (es.dwError != 0 || m.failed)
-    {
-        if (m.buf != NULL)
-            free(m.buf);
-        MessageBox(hwndEdit,
-                   "Unable to save the file.",
-                   "Save",
-                   MB_OK | MB_ICONERROR);
-        return 0;
-    }
     if (g_showSource)
     {
-        md = m.buf != NULL ? m.buf : NULL;
+        md = stream_editor_text_out(hwndEdit);
         if (md == NULL)
         {
-            md = (char *)malloc(1);
-            if (md == NULL)
-            {
-                MessageBox(hwndEdit,
-                           "Out of memory.",
-                           "Save",
-                           MB_OK | MB_ICONERROR);
-                return 0;
-            }
-            md[0] = '\0';
+            MessageBox(hwndEdit,
+                       _T("Unable to save the file."),
+                       _T("Save"),
+                       MB_OK | MB_ICONERROR);
+            return 0;
         }
         ok = write_entire_file(filename, md);
         free(md);
         if (!ok)
         {
             MessageBox(hwndEdit,
-                       "Unable to create the file.",
-                       "Save",
+                       _T("Unable to create the file."),
+                       _T("Save"),
                        MB_OK | MB_ICONERROR);
             return 0;
         }
-        strncpy(g_filename, filename, MAX_PATH - 1);
-        g_filename[MAX_PATH - 1] = '\0';
+        _tcsncpy(g_filename, filename, MAX_PATH - 1);
+        g_filename[MAX_PATH - 1] = _T('\0');
         UpdateTitle();
         return 1;
+    }
+    memset(&m, 0, sizeof(m));
+    memset(&es, 0, sizeof(es));
+    es.dwCookie = (DWORD_PTR)&m;
+    es.pfnCallback = StreamOutMemCallback;
+    SendMessage(hwndEdit,
+                EM_STREAMOUT,
+                (WPARAM)SF_RTF,
+                (LPARAM)&es);
+    if (es.dwError != 0 || m.failed)
+    {
+        if (m.buf != NULL)
+            free(m.buf);
+        MessageBox(hwndEdit,
+                   _T("Unable to save the file."),
+                   _T("Save"),
+                   MB_OK | MB_ICONERROR);
+        return 0;
     }
     rtf = m.buf != NULL ? m.buf : NULL;
     if (rtf == NULL)
@@ -3564,8 +3515,8 @@ SaveMarkdown(HWND hwndEdit, const char *filename)
         if (rtf == NULL)
         {
             MessageBox(hwndEdit,
-                       "Out of memory.",
-                       "Save",
+                       _T("Out of memory."),
+                       _T("Save"),
                        MB_OK | MB_ICONERROR);
             return 0;
         }
@@ -3576,8 +3527,8 @@ SaveMarkdown(HWND hwndEdit, const char *filename)
     if (md == NULL)
     {
         MessageBox(hwndEdit,
-                   "Out of memory.",
-                   "Save",
+                   _T("Out of memory."),
+                   _T("Save"),
                    MB_OK | MB_ICONERROR);
         return 0;
     }
@@ -3586,19 +3537,19 @@ SaveMarkdown(HWND hwndEdit, const char *filename)
     if (!ok)
     {
         MessageBox(hwndEdit,
-                   "Unable to create the file.",
-                   "Save",
+                   _T("Unable to create the file."),
+                   _T("Save"),
                    MB_OK | MB_ICONERROR);
         return 0;
     }
-    strncpy(g_filename, filename, MAX_PATH - 1);
-    g_filename[MAX_PATH - 1] = '\0';
+    _tcsncpy(g_filename, filename, MAX_PATH - 1);
+    g_filename[MAX_PATH - 1] = _T('\0');
     UpdateTitle();
     return 1;
 }
 
 static int
-LoadAny(HWND hwndEdit, const char *filename)
+LoadAny(HWND hwndEdit, LPCTSTR filename)
 {
     if (is_markdown_file(filename))
         return LoadMarkdown(hwndEdit, filename);
@@ -3606,7 +3557,7 @@ LoadAny(HWND hwndEdit, const char *filename)
 }
 
 static int
-SaveAny(HWND hwndEdit, const char *filename)
+SaveAny(HWND hwndEdit, LPCTSTR filename)
 {
     if (is_markdown_file(filename))
         return SaveMarkdown(hwndEdit, filename);
@@ -3623,7 +3574,7 @@ static int
 Open_File(HWND hwnd)
 {
     OPENFILENAME ofn;
-    char filename[MAX_PATH];
+    TCHAR filename[MAX_PATH];
 
     memset(&ofn, 0, sizeof(ofn));
     memset(filename, 0, sizeof(filename));
@@ -3631,16 +3582,16 @@ Open_File(HWND hwnd)
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
     ofn.lpstrFilter =
-        "Markdown (*.md;*.markdown;*.mkd;*.mdown;*.txt)\0"
-        "*.md;*.markdown;*.mkd;*.mdown;*.txt\0"
-        "Rich Text Format (*.rtf)\0*.rtf\0"
-        "All Files (*.*)\0*.*\0\0";
+        _T("Markdown (*.md;*.markdown;*.mkd;*.mdown;*.txt)\0")
+        _T("*.md;*.markdown;*.mkd;*.mdown;*.txt\0")
+        _T("Rich Text Format (*.rtf)\0*.rtf\0")
+        _T("All Files (*.*)\0*.*\0\0");
     ofn.lpstrFile = filename;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST |
                 OFN_HIDEREADONLY |
                 OFN_PATHMUSTEXIST;
-    ofn.lpstrDefExt = "md";
+    ofn.lpstrDefExt = _T("md");
 
     if (!GetOpenFileName(&ofn))
         return 0;
@@ -3652,37 +3603,37 @@ static int
 SaveAsFile(HWND hwnd)
 {
     OPENFILENAME ofn;
-    char filename[MAX_PATH];
+    TCHAR filename[MAX_PATH];
 
     memset(&ofn, 0, sizeof(ofn));
     memset(filename, 0, sizeof(filename));
 
-    if (g_filename[0] != '\0')
+    if (g_filename[0] != _T('\0'))
     {
-        strncpy(filename, g_filename, MAX_PATH - 1);
-        filename[MAX_PATH - 1] = '\0';
+        _tcsncpy(filename, g_filename, MAX_PATH - 1);
+        filename[MAX_PATH - 1] = _T('\0');
     }
     else
     {
-        strcpy(filename, "document.md");
+        _tcscpy(filename, _T("document.md"));
     }
 
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
     ofn.lpstrFilter =
-        "Markdown (*.md;*.markdown;*.mkd;*.mdown;*.txt)\0"
-        "*.md;*.markdown;*.mkd;*.mdown;*.txt\0"
-        "Rich Text Format (*.rtf)\0*.rtf\0"
-        "All Files (*.*)\0*.*\0\0";
+        _T("Markdown (*.md;*.markdown;*.mkd;*.mdown;*.txt)\0")
+        _T("*.md;*.markdown;*.mkd;*.mdown;*.txt\0")
+        _T("Rich Text Format (*.rtf)\0*.rtf\0")
+        _T("All Files (*.*)\0*.*\0\0");
     ofn.lpstrFile = filename;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_OVERWRITEPROMPT |
                 OFN_HIDEREADONLY |
                 OFN_PATHMUSTEXIST;
     if (is_markdown_file(filename))
-        ofn.lpstrDefExt = "md";
+        ofn.lpstrDefExt = _T("md");
     else
-        ofn.lpstrDefExt = "rtf";
+        ofn.lpstrDefExt = _T("rtf");
 
     if (!GetSaveFileName(&ofn))
         return 0;
@@ -3693,7 +3644,7 @@ SaveAsFile(HWND hwnd)
 static int
 SaveFile(HWND hwnd)
 {
-    if (g_filename[0] == '\0')
+    if (g_filename[0] == _T('\0'))
         return SaveAsFile(hwnd);
 
     return SaveAny(g_hwndEdit, g_filename);
@@ -3751,6 +3702,118 @@ stream_editor_in(HWND hwndEdit, WPARAM fmt, const char *text)
     return es.dwError == 0;
 }
 
+#ifdef UNICODE
+/*
+ * ----------------------------------------------------------------------
+ * UTF-8 <-> UTF-16 boundary (Unicode build only)
+ * ----------------------------------------------------------------------
+ *
+ * Converters and files stay byte-based (UTF-8 + RTF); only text
+ * exchanged with the Unicode control needs conversion. Both helpers
+ * return malloc'd buffers; caller frees (NULL on failure).
+ */
+
+static WCHAR *
+utf8_to_wide(const char *s)
+{
+    int n;
+    WCHAR *w;
+
+    if (s == NULL)
+        s = "";
+    n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0)
+        return NULL;
+    w = (WCHAR *)malloc((size_t)n * sizeof(WCHAR));
+    if (w == NULL)
+        return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n) <= 0)
+    {
+        free(w);
+        return NULL;
+    }
+    return w;
+}
+
+static char *
+wide_to_utf8(const WCHAR *w, int wlen)
+{
+    int n;
+    char *s;
+
+    if (w == NULL)
+        return NULL;
+    n = WideCharToMultiByte(CP_UTF8, 0, w, wlen, NULL, 0, NULL, NULL);
+    if (n <= 0)
+        return NULL;
+    s = (char *)malloc((size_t)n + 1);
+    if (s == NULL)
+        return NULL;
+    if (WideCharToMultiByte(CP_UTF8, 0, w, wlen, s, n, NULL, NULL) <= 0)
+    {
+        free(s);
+        return NULL;
+    }
+    s[n] = '\0';
+    return s;
+}
+#endif
+
+/*
+ * Plain-text exchange with the control, always UTF-8 on the caller
+ * side (converts to/from UTF-16 in the Unicode build).
+ */
+static char *
+stream_editor_text_out(HWND hwndEdit)
+{
+    char *raw;
+#ifdef UNICODE
+    char *utf8;
+#endif
+
+    raw = stream_editor_out(hwndEdit, SF_TEXT);
+    if (raw == NULL)
+        return NULL;
+#ifdef UNICODE
+    utf8 = wide_to_utf8((const WCHAR *)raw, -1);
+    free(raw);
+    return utf8;
+#else
+    return raw;
+#endif
+}
+
+static int
+stream_editor_text_in(HWND hwndEdit, const char *text)
+{
+#ifdef UNICODE
+    WCHAR *w;
+    int ok;
+
+    w = utf8_to_wide(text);
+    if (w == NULL)
+        return 0;
+    {
+        MemIn m;
+        EDITSTREAM es;
+
+        memset(&m, 0, sizeof(m));
+        m.buf = (const char *)w;
+        m.len = (LONG)(wcslen(w) * sizeof(WCHAR));
+        m.pos = 0;
+        memset(&es, 0, sizeof(es));
+        es.dwCookie = (DWORD_PTR)&m;
+        es.pfnCallback = StreamInMemCallback;
+        SendMessage(hwndEdit, EM_STREAMIN, (WPARAM)SF_TEXT, (LPARAM)&es);
+        ok = (es.dwError == 0);
+    }
+    free(w);
+    return ok;
+#else
+    return stream_editor_in(hwndEdit, SF_TEXT, text);
+#endif
+}
+
 static void
 reset_source_format(void)
 {
@@ -3767,7 +3830,7 @@ reset_source_format(void)
     cf.dwEffects = 0;
     cf.yHeight = 200;
     cf.bCharSet = DEFAULT_CHARSET;
-    strcpy(cf.szFaceName, "Courier New");
+    _tcscpy(cf.szFaceName, _T("Courier New"));
     SendMessage(g_hwndEdit, EM_SETCHARFORMAT,
                 (WPARAM)SCF_ALL, (LPARAM)&cf);
     memset(&pf, 0, sizeof(pf));
@@ -3820,7 +3883,7 @@ SetSourceMode(int on)
         if (out == NULL)
         {
             MessageBox(g_hwndMain,
-                       "Unable to read editor content.",
+                       _T("Unable to read editor content."),
                        WND_TITLE,
                        MB_OK | MB_ICONERROR);
             return;
@@ -3830,16 +3893,16 @@ SetSourceMode(int on)
         if (conv == NULL)
         {
             MessageBox(g_hwndMain,
-                       "Out of memory.",
+                       _T("Out of memory."),
                        WND_TITLE,
                        MB_OK | MB_ICONERROR);
             return;
         }
-        if (!stream_editor_in(g_hwndEdit, SF_TEXT, conv))
+        if (!stream_editor_text_in(g_hwndEdit, conv))
         {
             free(conv);
             MessageBox(g_hwndMain,
-                       "Unable to show markdown source.",
+                       _T("Unable to show markdown source."),
                        WND_TITLE,
                        MB_OK | MB_ICONERROR);
             return;
@@ -3850,11 +3913,11 @@ SetSourceMode(int on)
     }
     else
     {
-        out = stream_editor_out(g_hwndEdit, SF_TEXT);
+        out = stream_editor_text_out(g_hwndEdit);
         if (out == NULL)
         {
             MessageBox(g_hwndMain,
-                       "Unable to read editor content.",
+                       _T("Unable to read editor content."),
                        WND_TITLE,
                        MB_OK | MB_ICONERROR);
             return;
@@ -3864,7 +3927,7 @@ SetSourceMode(int on)
         {
             free(out);
             MessageBox(g_hwndMain,
-                       "Out of memory.",
+                       _T("Out of memory."),
                        WND_TITLE,
                        MB_OK | MB_ICONERROR);
             return;
@@ -3874,7 +3937,7 @@ SetSourceMode(int on)
             free(conv);
             free(out);
             MessageBox(g_hwndMain,
-                       "Unable to show rich text.",
+                       _T("Unable to show rich text."),
                        WND_TITLE,
                        MB_OK | MB_ICONERROR);
             return;
@@ -3899,6 +3962,14 @@ SetSourceMode(int on)
  * version; the URL is recovered at click time (field RTF on new
  * controls, nearby "<url>"/bare URL text on old ones).
  */
+
+/* Markdown files are UTF-8; the Unicode build converts them with
+   CP_UTF8. The ANSI build keeps CP_ACP (historical behavior). */
+#ifdef UNICODE
+#define MD_CODEPAGE CP_UTF8
+#else
+#define MD_CODEPAGE CP_ACP
+#endif
 
 #define MD_MAX_LINKS 256
 #define MD_LINK_TEXT_MAX 256
@@ -4033,7 +4104,7 @@ range_has_link(LONG s, LONG e)
 {
     CHARRANGE cr;
     CHARRANGE old;
-    CHARFORMATA cf;
+    CHARFORMAT cf;
 
     if (s < 0 || e <= s)
         return 0;
@@ -4058,7 +4129,7 @@ apply_link_effects(const char *md)
     LONG pos;
     CHARRANGE old;
     CHARRANGE cr;
-    CHARFORMATA cf;
+    CHARFORMAT cf;
     WCHAR wtext[MD_LINK_TEXT_MAX];
     char needle[1024];
     WCHAR wneedle[1024];
@@ -4087,7 +4158,7 @@ apply_link_effects(const char *md)
         found = 0;
         /* Phase 1: native field link (Msftedit marks results CFE_LINK).
            Plain lookalikes are skipped, never linked: no phantoms. */
-        wlen = MultiByteToWideChar(CP_ACP, 0, links[i].text, -1,
+        wlen = MultiByteToWideChar(MD_CODEPAGE, 0, links[i].text, -1,
                                    wtext, MD_LINK_TEXT_MAX);
         if (wlen > 1)
         {
@@ -4137,7 +4208,7 @@ apply_link_effects(const char *md)
                 needle[dl + 1] = '<';
                 memcpy(needle + dl + 2, links[i].url, un);
                 needle[dl + 2 + un] = '\0';
-                if (MultiByteToWideChar(CP_ACP, 0, needle, -1,
+                if (MultiByteToWideChar(MD_CODEPAGE, 0, needle, -1,
                                         wneedle, 1024) > 1)
                 {
                     ftw.chrg.cpMin = pos;
@@ -4321,7 +4392,8 @@ find_url_in_text(const char *s, char *out, int outsz)
     return 1;
 }
 
-/* Visible text of the clicked paragraph (line). Caller frees. */
+/* Visible text of the clicked paragraph (line), always UTF-8.
+   Caller frees. */
 static char *
 get_line_text(LONG chpos)
 {
@@ -4329,8 +4401,11 @@ get_line_text(LONG chpos)
     LONG ls;
     LONG llen;
     LONG cap;
-    char *buf;
+    TCHAR *buf;
     WORD n16;
+#ifdef UNICODE
+    char *utf8;
+#endif
 
     ln = (LONG)SendMessage(g_hwndEdit, EM_EXLINEFROMCHAR, 0,
                            (LPARAM)chpos);
@@ -4343,7 +4418,7 @@ get_line_text(LONG chpos)
     if (llen > 2048)
         llen = 2048;
     cap = llen + 1;
-    buf = (char *)malloc((size_t)cap + 1);
+    buf = (TCHAR *)malloc(((size_t)cap + 1) * sizeof(TCHAR));
     if (buf == NULL)
         return NULL;
     n16 = (WORD)cap;
@@ -4354,8 +4429,14 @@ get_line_text(LONG chpos)
         llen = 0;
     if (llen > cap)
         llen = cap;
-    buf[llen] = '\0';
+    buf[llen] = _T('\0');
+#ifdef UNICODE
+    utf8 = wide_to_utf8(buf, (int)llen);
+    free(buf);
+    return utf8;
+#else
     return buf;
+#endif
 }
 
 /* Visible text of the current selection (no hidden field codes,
@@ -4380,7 +4461,18 @@ get_selection_text(void)
             free(m.buf);
         return NULL;
     }
+#ifdef UNICODE
+    {
+        char *utf8;
+
+        utf8 = wide_to_utf8((const WCHAR *)m.buf,
+                            (int)(m.len / sizeof(WCHAR)));
+        free(m.buf);
+        return utf8;
+    }
+#else
     return m.buf;
+#endif
 }
 
 /* RTF of the current selection (carries HYPERLINK "url" for fields). */
@@ -4500,14 +4592,36 @@ OpenLinkAtRange(CHARRANGE *cr)
         free(url);
         return;
     }
+#ifdef UNICODE
+    {
+        WCHAR *wurl;
+
+        wurl = utf8_to_wide(url);
+        if (wurl == NULL)
+        {
+            free(url);
+            return;
+        }
+        if ((INT_PTR)ShellExecute(NULL, _T("open"), wurl,
+                                  NULL, NULL, SW_SHOWNORMAL) <= 32)
+        {
+            MessageBox(g_hwndMain,
+                       _T("Unable to open link."),
+                       WND_TITLE,
+                       MB_OK | MB_ICONERROR);
+        }
+        free(wurl);
+    }
+#else
     if ((INT_PTR)ShellExecuteA(NULL, "open", url,
                                NULL, NULL, SW_SHOWNORMAL) <= 32)
     {
         MessageBox(g_hwndMain,
-                   "Unable to open link.",
+                   _T("Unable to open link."),
                    WND_TITLE,
                    MB_OK | MB_ICONERROR);
     }
+#endif
     free(url);
 }
 
@@ -4528,30 +4642,30 @@ CreateMainMenu(void)
 
     fileMenu = CreatePopupMenu();
 
-    AppendMenu(fileMenu, MF_STRING, IDM_OPEN,   "&Open...");
-    AppendMenu(fileMenu, MF_STRING, IDM_SAVE,   "&Save");
-    AppendMenu(fileMenu, MF_STRING, IDM_SAVEAS, "Save &As...");
+    AppendMenu(fileMenu, MF_STRING, IDM_OPEN,   _T("&Open..."));
+    AppendMenu(fileMenu, MF_STRING, IDM_SAVE,   _T("&Save"));
+    AppendMenu(fileMenu, MF_STRING, IDM_SAVEAS, _T("Save &As..."));
     AppendMenu(fileMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenu(fileMenu, MF_STRING, IDM_EXIT,   "E&xit");
+    AppendMenu(fileMenu, MF_STRING, IDM_EXIT,   _T("E&xit"));
 
     AppendMenu(menu, MF_POPUP,
-               (UINT_PTR)fileMenu, "&File");
+               (UINT_PTR)fileMenu, _T("&File"));
 
     editMenu = CreatePopupMenu();
 
-    AppendMenu(editMenu, MF_STRING, IDM_UNDO,      "&Undo");
+    AppendMenu(editMenu, MF_STRING, IDM_UNDO,      _T("&Undo"));
     AppendMenu(editMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenu(editMenu, MF_STRING, IDM_CUT,       "Cu&t");
-    AppendMenu(editMenu, MF_STRING, IDM_COPY,      "&Copy");
-    AppendMenu(editMenu, MF_STRING, IDM_PASTE,     "&Paste");
+    AppendMenu(editMenu, MF_STRING, IDM_CUT,       _T("Cu&t"));
+    AppendMenu(editMenu, MF_STRING, IDM_COPY,      _T("&Copy"));
+    AppendMenu(editMenu, MF_STRING, IDM_PASTE,     _T("&Paste"));
     AppendMenu(editMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenu(editMenu, MF_STRING, IDM_SELECTALL, "Select &All");
+    AppendMenu(editMenu, MF_STRING, IDM_SELECTALL, _T("Select &All"));
     AppendMenu(editMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(editMenu, MF_STRING | MF_UNCHECKED,
-               IDM_SHOW_SOURCE, "Show &Markdown Source");
+               IDM_SHOW_SOURCE, _T("Show &Markdown Source"));
 
     AppendMenu(menu, MF_POPUP,
-               (UINT_PTR)editMenu, "&Edit");
+               (UINT_PTR)editMenu, _T("&Edit"));
 
     return menu;
 }
@@ -4573,8 +4687,8 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
             g_hwndEdit = CreateWindowEx(
                 WS_EX_CLIENTEDGE,
-                g_editClass != NULL ? g_editClass : RICHEDIT_CLASSA,
-                "",
+                g_editClass != NULL ? g_editClass : RICHEDIT_CLASS,
+                _T(""),
                 WS_CHILD |
                 WS_VISIBLE |
                 WS_VSCROLL |
@@ -4732,10 +4846,18 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
  * ----------------------------------------------------------------------
  */
 
+/* UNICODE selects the entry point: wWinMain for the Unicode
+   flavor, WinMain for ANSI. LPTSTR adapts with it. */
+#ifdef UNICODE
+#define APP_ENTRY wWinMain
+#else
+#define APP_ENTRY WinMain
+#endif
+
 int WINAPI
-WinMain(HINSTANCE hInstance,
+APP_ENTRY(HINSTANCE hInstance,
         HINSTANCE hPrevInstance,
-        LPSTR lpCmdLine,
+        LPTSTR lpCmdLine,
         int nCmdShow)
 {
     WNDCLASS wc;
@@ -4743,7 +4865,7 @@ WinMain(HINSTANCE hInstance,
     MSG msg;
     HMENU menu;
     UINT oldErrMode;
-    char cmdFile[MAX_PATH];
+    TCHAR cmdFile[MAX_PATH];
 
     (void)hPrevInstance;
 
@@ -4752,7 +4874,7 @@ WinMain(HINSTANCE hInstance,
     g_hwndEdit = NULL;
     g_hRichEdit = NULL;
     g_editClass = NULL;
-    g_filename[0] = '\0';
+    g_filename[0] = _T('\0');
     g_showSource = 0;
     g_isRE10 = 0;
 
@@ -4767,23 +4889,26 @@ WinMain(HINSTANCE hInstance,
      * Msftedit only provides the Unicode RICHEDIT50W class, but byte
      * based SF_RTF streaming still works from this ANSI app.
      */
-    g_hRichEdit = LoadLibrary("Msftedit.dll");
+    g_hRichEdit = LoadLibrary(_T("Msftedit.dll"));
 
     if (g_hRichEdit != NULL)
     {
-        /* NOTE: use ANSI literal, not MSFTEDIT_CLASS macro which is
+        /* NOTE: use _T literal, not MSFTEDIT_CLASS macro which is
            wide (L"RICHEDIT50W") in newer SDKs. */
-        g_editClass = "RICHEDIT50W";
+        g_editClass = _T("RICHEDIT50W");
     }
     else
     {
-        g_hRichEdit = LoadLibrary("RICHED20.DLL");
-        g_editClass = RICHEDIT_CLASSA;
+        g_hRichEdit = LoadLibrary(_T("RICHED20.DLL"));
+        g_editClass = RICHEDIT_CLASS;
+#ifndef UNICODE
+        /* RichEdit 1.0 is ANSI-only: no Unicode build fallback. */
         if (g_hRichEdit == NULL) {
-            g_hRichEdit = LoadLibrary("RICHED32.DLL");
-            g_editClass = "RICHEDIT";
+            g_hRichEdit = LoadLibrary(_T("RICHED32.DLL"));
+            g_editClass = _T("RICHEDIT");
             g_isRE10 = 1;
         }
+#endif
     }
 
     /* Restore old Error Mode */
@@ -4791,7 +4916,7 @@ WinMain(HINSTANCE hInstance,
     if (g_hRichEdit == NULL)
     {
         MessageBox(NULL,
-                   "Unable to load Msftedit.dll or RICHED20.DLL.",
+                   _T("Unable to load Msftedit.dll or RICHED20.DLL."),
                    WND_TITLE,
                    MB_OK | MB_ICONERROR);
         return 1;

@@ -37,6 +37,21 @@ gcc -std=c89 -mwindows richedit.c -o richedit.exe \
     -luser32 -lgdi32 -lcomdlg32 -lshell32
 ```
 
+Unicode flavor (filenames, titles, dialogs and URLs in UTF-16;
+converters and `.md`/`.rtf` files stay UTF-8):
+
+```bat
+cl /Ox /DUNICODE /D_UNICODE richedit.c user32.lib comdlg32.lib shell32.lib
+```
+
+```sh
+gcc -std=c89 -DUNICODE -D_UNICODE -municode -mwindows richedit.c \
+    -o richedit_uni.exe -luser32 -lgdi32 -lcomdlg32 -lshell32
+```
+
+The Unicode flavor needs Msftedit or `RICHED20` (the `RICHED32`
+1.0 fallback is ANSI-only and compiled out).
+
 The code is strict C89 (declarations first, no `//` comments,
 no `snprintf`) and compiles warning-clean apart from pre-existing
 64-bit `DWORD_PTR`/callback cast notes.
