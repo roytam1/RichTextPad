@@ -62,10 +62,10 @@
 #define SCF_ALL 0x0004
 #endif
 #ifndef RICHEDIT_CLASS
-#define RICHEDIT_CLASS "RichEdit20W"
+#define RICHEDIT_CLASS _T("RichEdit20W")
 #endif
 #ifndef RICHEDIT_CLASSA
-#define RICHEDIT_CLASSA "RichEdit20A"
+#define RICHEDIT_CLASSA _T("RichEdit20A")
 #endif
 #ifndef EM_FINDTEXTEXW
 #define EM_FINDTEXTEXW (WM_USER + 124)
@@ -5394,6 +5394,21 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         return 0;
 
+        case WM_DROPFILES: {
+            HDROP hDrop = (HDROP)wParam;
+            TCHAR szDropFile[MAX_PATH];
+
+            // Get the count of dropped files (we only care about the first one)
+            if (DragQueryFile(hDrop, 0, szDropFile, MAX_PATH)) {
+                SetForegroundWindow(hwnd);
+                LoadAny(g_hwndEdit, szDropFile);
+            }
+
+            // Must release the handle allocated by the shell
+            DragFinish(hDrop);
+            return 0;
+        }
+
     case WM_SETFOCUS:
         if (g_hwndEdit != NULL)
             SetFocus(g_hwndEdit);
@@ -5583,7 +5598,7 @@ APP_ENTRY(HINSTANCE hInstance,
 
     menu = CreateMainMenu();
 
-    hwnd = CreateWindow(
+    hwnd = CreateWindowEx(WS_EX_ACCEPTFILES,
         WNDCLASS_NAME,
         WND_TITLE,
         WS_OVERLAPPEDWINDOW,
